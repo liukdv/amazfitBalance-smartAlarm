@@ -1,0 +1,14 @@
+{
+  "name": "amazfit-smart-alarm-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zepp OS mini app: smart alarm for the Amazfit Active 2",
+  "scripts": {
+    "dev": "zeus dev",
+    "preview": "zeus preview",
+    "build": "zeus build"
+  },
+  "dependencies": {
+    "@zeppos/zml": "^0.0.43"
+  }
+}

@@ -1,0 +1,11 @@
+# Ingest of the watch logs, to be added inside an existing HTTPS server block.
+#
+# auth_basic off: the POST comes from the Zepp app on the phone, which sends no
+# credentials; the protection is the secret token in the path. Write only — the
+# content is read over ssh, never from the web.
+location /wlog {
+    auth_basic off;
+    proxy_pass http://127.0.0.1:8096;
+    proxy_set_header Host $host;
+    client_max_body_size 256k;
+}

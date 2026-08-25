@@ -1,0 +1,24 @@
+{
+  "name": "amazfit-smart-alarm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Smart alarm for the Amazfit Active 2 (Zepp OS 5)",
+  "scripts": {
+    "test": "node --import ./test/register.mjs test/run.mjs && node --import ./test/register.mjs test/decide.mjs && node --import ./test/register.mjs test/schedule.mjs && node --import ./test/register.mjs test/alarm-page.mjs && node --import ./test/register.mjs test/service.mjs && node --import ./test/register.mjs test/ring-page.mjs && node --import ./test/register.mjs test/lookout.mjs && node --import ./test/register.mjs test/threshold.mjs",
+    "test:ring": "node --import ./test/register.mjs test/ring-page.mjs",
+    "test:logic": "node --import ./test/register.mjs test/run.mjs",
+    "test:decide": "node --import ./test/register.mjs test/decide.mjs",
+    "test:schedule": "node --import ./test/register.mjs test/schedule.mjs",
+    "test:page": "node --import ./test/register.mjs test/alarm-page.mjs",
+    "test:service": "node --import ./test/register.mjs test/service.mjs",
+    "build": "cd probe && zeus build",
+    "verify": "node tools/verify-build.mjs",
+    "check": "npm run test && npm run build && npm run verify",
+    "deploy": "node tools/deploy.mjs",
+    "bridge": "cd probe && zeus bridge"
+  },
+  "devDependencies": {
+    "jsqr": "^1.4.0"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appId": 1043001,
+    "appName": "SmartAlarm",
+    "appType": "app",
+    "version": { "code": 1, "name": "0.1.0" },
+    "icon": "icon.png",
+    "vender": "stefanopochet",
+    "description": "Smart alarm: wakes you on wrist movement inside a window before the set time"
+  },
+  "permissions": [
+    "data:user.hd.sleep",
+    "data:user.hd.heart_rate",
+    "device:os.local_storage",
+    "device:os.alarm",
+    "device:os.bg_service",
+    "device:os.accelerometer"
+  ],
+  "runtime": {
+    "apiVersion": { "compatible": "3.0.0", "target": "4.0.0", "minVersion": "3.0.0" }
+  },
+  "targets": {
+    "active2-round": {
+      "module": {
+        "page": { "pages": ["page/index", "page/debug", "page/ring", "page/lookout"] },
+        "app-service": { "services": ["app-service/probe"] },
+        "app-side": { "path": "app-side/index" }
+      },
+      "platforms": [
+        { "name": "Milan", "deviceSource": 8913152 },
+        { "name": "MilanWNFC", "deviceSource": 8913153 },
+        { "name": "MilanW", "deviceSource": 8913155 },
+        { "name": "MilanWNA", "deviceSource": 8913159 },
+        { "name": "Milan64", "deviceSource": 10092800 },
+        { "name": "MilanWNFC64", "deviceSource": 10092801 },
+        { "name": "MilanW64", "deviceSource": 10092803 },
+        { "name": "MilanWNA64", "deviceSource": 10092807 }
+      ],
+      "designWidth": 466
+    },
+    "active2-square": {
+      "module": {
+        "page": { "pages": ["page/index", "page/debug", "page/ring", "page/lookout"] },
+        "app-service": { "services": ["app-service/probe"] },
+        "app-side": { "path": "app-side/index" }
+      },
+      "platforms": [
+        { "name": "Rome64", "deviceSource": 10223872 },
+        { "name": "RomeWNFC64", "deviceSource": 10223873 },
+        { "name": "RomeW64", "deviceSource": 10223875 }
+      ],
+      "designWidth": 390
+    }
+  },
+  "i18n": {
+    "en-US": { "appName": "SmartAlarm" }
+  },
+  "defaultLanguage": "en-US"
+}

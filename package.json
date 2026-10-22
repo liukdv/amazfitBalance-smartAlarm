@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Smart alarm for the Amazfit Active 2 (Zepp OS 5)",
   "scripts": {
-    "test": "node --import ./test/register.mjs test/run.mjs && node --import ./test/register.mjs test/decide.mjs && node --import ./test/register.mjs test/schedule.mjs && node --import ./test/register.mjs test/alarm-page.mjs && node --import ./test/register.mjs test/service.mjs && node --import ./test/register.mjs test/ring-page.mjs && node --import ./test/register.mjs test/lookout.mjs && node --import ./test/register.mjs test/threshold.mjs",
+    "test": "node --import ./test/register.mjs test/run.mjs && node --import ./test/register.mjs test/decide.mjs && node --import ./test/register.mjs test/schedule.mjs && node --import ./test/register.mjs test/alarm-page.mjs && node --import ./test/register.mjs test/alarms.mjs && node --import ./test/register.mjs test/service.mjs && node --import ./test/register.mjs test/ring-page.mjs && node --import ./test/register.mjs test/lookout.mjs && node --import ./test/register.mjs test/threshold.mjs",
     "test:ring": "node --import ./test/register.mjs test/ring-page.mjs",
     "test:logic": "node --import ./test/register.mjs test/run.mjs",
     "test:decide": "node --import ./test/register.mjs test/decide.mjs",

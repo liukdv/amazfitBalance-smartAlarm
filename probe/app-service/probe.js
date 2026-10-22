@@ -1,21 +1,17 @@
-// Background service. Woken by the Alarm API once a minute: it samples, decides,
-// and reschedules its own next wake-up.
-//
-// Every step writes to the event diary. That is deliberate: if this service does
-// not start, the only way to know is the ABSENCE of its lines; if it starts and
-// fails, the reason has to be written down somewhere, because there is no
-// console on a watch and nobody is watching while it happens.
+// Background service: scheduled checks, bedtime reminders and deadline fallback.
+// Periodic tick logs are collected only in VERBOSE mode;
+// alarm events and failures are retained in MINIMAL mode too.
 //
 // Every run must fit within ~600ms: nothing slow in here.
 // Note: alarm.set() uses file/date as in the official CLI template, not
 // url/delay as in the online documentation.
 import * as alarmMgr from '@zos/alarm'
 import { getPackageInfo } from '@zos/app'
-import { appendLine, logEvent } from '../utils/log'
-import { takeSample, readState, wakeableModels } from '../utils/sample'
-import { load, patch } from '../utils/store'
+import { notify } from '@zos/notification'
+import { logEvent } from '../utils/log'
+import { alarmContext, dismissAlarm, REPEAT_AFTER_SEC } from '../utils/alarms'
 import { decide } from '../utils/decide'
-import { nextDelay } from '../utils/schedule'
+import { nextDelay, fmtTime } from '../utils/schedule'
 import { wakeBuzz } from '../utils/vibrate'
 
 const SERVICE_FILE = 'app-service/probe'
@@ -25,7 +21,10 @@ const RING_GAP_MIN_SEC = 45 // two rings are never closer than this (chain + fai
 
 // The "night log" flag (store.debugLog): once stable, the deep log can be turned
 // off. ESSENTIAL events (vibrations, errors) are written regardless.
-let DBG = true
+let DBG = false
+let context
+const load = () => context.load()
+const patch = (delta) => context.patch(delta)
 function dbgEvent(tag, data) {
   if (DBG) logEvent(tag, data)
 }
@@ -36,22 +35,22 @@ function dbgEvent(tag, data) {
 function scheduleNext(delaySec) {
   const { appId } = getPackageInfo()
   const at = Math.floor(Date.now() / 1000) + (delaySec || 60)
-  const id = alarmMgr.set({
+  const id = context.schedule({
     appid: appId,
     file: SERVICE_FILE,
     date: at,
     param: 'tick',
     repeat_type: alarmMgr.ONCE,
     store: true,
-  })
-  // Check that the alarm is REALLY queued: set() can return an id and the system
-  // discard it anyway. Without this check the chain dies silently and it looks
-  // like the service never started.
-  let queued = 'n/a'
-  try {
-    queued = alarmMgr.getAllAlarms ? JSON.stringify(alarmMgr.getAllAlarms()) : 'n/a'
-  } catch (e) {}
-  dbgEvent('SVC rescheduled', { id, at, in: delaySec, queued })
+  }, 'tick')
+  if (DBG) {
+    // Include the queue in verbose diagnostics to investigate missing wake-ups.
+    let queued = 'n/a'
+    try {
+      queued = alarmMgr.getAllAlarms ? JSON.stringify(alarmMgr.getAllAlarms()) : 'n/a'
+    } catch (e) {}
+    dbgEvent('SVC rescheduled', { id, at, in: delaySec, queued })
+  }
   return id
 }
 
@@ -84,14 +83,14 @@ function openRingPage(why) {
     // (ticks measured up to 9s on 22 Aug). With +2 the alarm could be born
     // already in the past and the firmware might discard it (23 Aug review,
     // finding 2).
-    id = alarmMgr.set({
+    id = context.schedule({
       appid: appId,
       url: RING_PAGE,
       date: Math.floor(Date.now() / 1000) + 15,
       param: 'ring',
       repeat_type: alarmMgr.ONCE,
       store: true,
-    })
+    }, 'ring')
   } catch (e) {
     try {
       logEvent('SVC page open ERROR', String(e && e.message))
@@ -121,8 +120,45 @@ function ring(st, nowUnix, why) {
   return res
 }
 
+/** Deliver a local bedtime notice once, without changing the wake-up timers. */
+function remindBedtime() {
+  const st = context.load()
+  const now = Math.floor(Date.now() / 1000)
+  const due = st.targetUnix - st.bedtimeMin * 60
+  if (st.mode !== 'alarm' || !(st.bedtimeMin > 0) || st.bedtimeSent === st.targetUnix) return
+  // Do not replay an old bedtime notice after a long shutdown or at wake-up.
+  if (now < due || now >= st.targetUnix || now - due > 15 * 60) {
+    logEvent('BEDTIME skipped', { id: context.id, due, now, reason: 'outside delivery interval' })
+    return
+  }
+  try {
+    const notification = notify({
+      title: 'Time to sleep',
+      content: 'Get ready for bed. Alarm: ' + fmtTime(st.alarmH, st.alarmM),
+      actions: [], vibrate: 4,
+    })
+    if (!notification) throw new Error('Notification rejected')
+    context.patch({ bedtimeSent: st.targetUnix })
+    logEvent('BEDTIME notified', { id: context.id, target: st.targetUnix, notification })
+  } catch (e) {
+    logEvent('BEDTIME notify ERROR', { id: context.id, error: String(e), stack: e && e.stack })
+  }
+}
+
 AppService({
   onInit(params) {
+    context = alarmContext(params)
+    if (!context.valid() || (!context.legacy && context.load().ringStop === 1)) return
+    params = context.event
+    if (params === 'bedtime') {
+      remindBedtime()
+      return
+    }
+    if (params === 'repeat') {
+      const value = context.load()
+      if (Date.now() / 1000 >= value.targetUnix + REPEAT_AFTER_SEC) dismissAlarm(context)
+      return
+    }
     let st
     try {
       st = load()
@@ -132,11 +168,11 @@ AppService({
         logEvent('SVC state ERROR', String(e && e.message))
       } catch (e2) {}
     }
-    DBG = !st || st.debugLog !== 0
+    DBG = st && st.debugLog === 1
 
     try {
       dbgEvent('SVC awake', { param: params === undefined ? null : String(params) })
-      dbgEvent('SVC state', { mode: st.mode, ticks: st.ticks, max: st.maxTicks, target: st.targetUnix, rings: st.rings })
+      dbgEvent('SVC state', { mode: st.mode, ticks: st.ticks, target: st.targetUnix, rings: st.rings })
     } catch (e) {}
 
     if (st.mode === 'idle') {
@@ -174,7 +210,6 @@ AppService({
       }
       try {
         dbgEvent('SVC idle, chain closed')
-        if (DBG) appendLine(takeSample('idle_stop'))
       } catch (e) {}
       return
     }
@@ -206,9 +241,6 @@ AppService({
       }
       const rings = (st.rings || 0) + (fired ? 1 : 0)
       finished = rings >= MAX_RINGS
-      try {
-        if (DBG) appendLine(takeSample(note + '|ring' + rings))
-      } catch (e) {}
       // STOP pressed DURING this tick: do not resurrect the ringing and do not
       // reschedule (22 Aug review, finding 5).
       try {
@@ -244,74 +276,25 @@ AppService({
       return
     }
 
-    if (st.mode === 'alarm') {
-      let raw = null
-      try {
-        raw = readState()
-        dbgEvent('SVC reading', raw)
-      } catch (e) {
-        try {
-          logEvent('SVC reading ERROR', String(e && e.message))
-        } catch (e2) {}
-      }
+    // Retired monitoring modes cannot keep a background chain running.
+    if (st.mode !== 'alarm') return
 
-      // ⚠️ The decision is ALWAYS taken, even if the sensors do not answer.
-      // With a null `raw` we pass empty values: decide() ignores the stages and
-      // fires the alarm at the deadline anyway. It used to skip the decision
-      // entirely when the reading failed — and in that case the alarm would
-      // NEVER have gone off. It is the kind of defect you do not notice until it
-      // happens, at night, once.
-      const safe = raw || { sleepingStatus: null, wearStatus: null, lastStageModel: null, lastStageStop: null }
-      if (!raw) note += '|reading failed'
-
-      let models = []
-      try {
-        models = wakeableModels()
-      } catch (e) {}
-
-      let d
-      try {
-        d = decide({
-          nowUnix,
-          targetUnix: st.targetUnix,
-          windowSec: st.windowSec,
-          sleepingStatus: safe.sleepingStatus,
-          wearStatus: safe.wearStatus,
-          lookoutActive: st.useLookout !== 0,
-          useStages: st.useStages === 1,
-          lastStageModel: safe.lastStageModel,
-          lastStageStop: safe.lastStageStop,
-          wakeableModels: models,
-        })
-      } catch (e) {
-        // Even if the decision blows up: past the deadline we ring.
-        d = { fire: nowUnix >= st.targetUnix, reason: 'decide ERROR ' + (e && e.message) }
-      }
-
-      try {
-        dbgEvent('SVC decision', { fire: d.fire, reason: d.reason, left: st.targetUnix - nowUnix, models })
-      } catch (e) {}
-      note += '|' + String(d.reason).replace(/[,|]/g, ' ')
-
-      if (d.fire) {
-        const res = ring(st, nowUnix, d.reason)
-        note += '|BUZZ:' + res
-        fired = true
-      }
-    }
-
-    const ticks = (st.ticks || 0) + 1
-    const limited = st.mode === 'monitor' && st.maxTicks > 0
-    finished = limited && ticks >= st.maxTicks
-    if (finished) note += '|monitor_done'
-
+    let d
     try {
-      if (DBG) appendLine(takeSample(note))
+      d = decide({ nowUnix, targetUnix: st.targetUnix, windowSec: st.windowSec })
     } catch (e) {
-      try {
-        logEvent('SVC sample write ERROR', String(e && e.message))
-      } catch (e2) {}
+      d = { fire: nowUnix >= st.targetUnix, reason: 'decide ERROR ' + (e && e.message) }
     }
+    try {
+      dbgEvent('SVC decision', { fire: d.fire, reason: d.reason, left: st.targetUnix - nowUnix })
+    } catch (e) {}
+    note += '|' + String(d.reason).replace(/[,|]/g, ' ')
+    if (d.fire) {
+      const res = ring(st, nowUnix, d.reason)
+      note += '|BUZZ:' + res
+      fired = true
+    }
+    const ticks = (st.ticks || 0) + 1
 
     // STOP pressed DURING this tick: do not rewrite the state and do not
     // reschedule (22 Aug review, finding 5).
@@ -329,20 +312,11 @@ AppService({
         fired: fired ? (st.fired || 0) + 1 : st.fired || 0,
         rings: fired ? 1 : st.rings || 0,
         lastRingUnix: fired ? nowUnix : st.lastRingUnix || 0,
-        // After the first ring we do NOT close any more: we switch to ringing
-        // mode and insist. The chain only closes at the end of monitoring or at
-        // the end of the ringing sequence.
-        mode: fired ? 'ringing' : finished ? 'idle' : st.mode,
-        done: finished ? 1 : st.done || 0,
+        // Keep retrying after the first ring until STOP or the vibration limit.
+        mode: fired ? 'ringing' : st.mode,
+        done: st.done || 0,
       })
     } catch (e) {}
-
-    if (finished) {
-      try {
-        logEvent('SVC end', { fired, finished, ticks })
-      } catch (e) {}
-      return
-    }
 
     // Long step far from the window, one minute inside it: there is no need to
     // wake up 480 times a night, but the chain must keep re-arming itself.
@@ -358,7 +332,6 @@ AppService({
     } catch (e) {
       try {
         logEvent('SVC reschedule ERROR', String(e && e.message))
-        appendLine(takeSample('realarm_err'))
       } catch (e2) {}
     }
   },

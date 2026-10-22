@@ -1,136 +1,198 @@
-// Tests for the THRESHOLD CURVE: the number to beat drops as the alarm time
-// approaches. Numbers tuned on the logs of the first real nights. Pure logic,
-// testable without a watch.
+// Window-dependent motion sensitivity and sensor continuity, without the watch runtime.
 import assert from 'node:assert/strict'
-import { peakThreshold, meanThreshold, describeCurve } from '../probe/utils/threshold.js'
+import { test } from 'node:test'
+import { MotionDetector, motionThreshold, normalizeSensitivity } from '../probe/utils/threshold.js'
 
-let pass = 0
-let fail = 0
-const failures = []
+const STILL = [0, 0, 1000]
+const TURN = [100, 0, Math.sqrt(1000000 - 10000)]
+const sample = (detector, vector, time) => detector.sample(...vector, time)
 
-function test(name, fn) {
-  try {
-    fn()
-    pass++
-    console.log('  ok   ' + name)
-  } catch (e) {
-    fail++
-    failures.push(name + ' -> ' + e.message)
-    console.log('  FAIL ' + name + '\n         ' + e.message)
-  }
-}
-
-const min = (m) => m * 60
-
-console.log('\n== the curve drops as the alarm time approaches ==')
-
-test('from 30 to 20 minutes: only a SIGNIFICANT movement (500)', () => {
-  assert.equal(peakThreshold(min(30)), 500)
-  assert.equal(peakThreshold(min(21)), 500)
-})
-
-test('from 20 to 15 minutes: 300', () => {
-  assert.equal(peakThreshold(min(20)), 300)
-  assert.equal(peakThreshold(min(16)), 300)
-})
-
-test('from 15 to 10 minutes: 200', () => {
-  assert.equal(peakThreshold(min(15)), 200)
-  assert.equal(peakThreshold(min(11)), 200)
-})
-
-test('from 10 to 5 minutes: LIGHT movement (100)', () => {
-  assert.equal(peakThreshold(min(10)), 100)
-  assert.equal(peakThreshold(min(6)), 100)
-})
-
-test('from 5 to 3 minutes: 80', () => {
-  assert.equal(peakThreshold(min(5)), 80)
-  assert.equal(peakThreshold(min(4)), 80)
-})
-
-test('at 3 minutes 60, at 2 minutes 40: the final descent', () => {
-  assert.equal(peakThreshold(min(3)), 60)
-  assert.equal(peakThreshold(150), 60)
-  assert.equal(peakThreshold(min(2)), 40)
-  assert.equal(peakThreshold(90), 40)
-})
-
-test('last minute: GRAVE level (20), almost anything goes', () => {
-  assert.equal(peakThreshold(60), 20)
-  assert.equal(peakThreshold(10), 20)
-  assert.equal(peakThreshold(0), 20)
-})
-
-console.log('\n== the curve must never climb back up ==')
-
-test('minute by minute, the threshold NEVER rises on the way to the alarm', () => {
-  let previous = Infinity
-  for (let s = min(35); s >= 0; s -= 10) {
-    const now = peakThreshold(s)
-    assert.ok(
-      now <= previous,
-      'at ' + s + 's the threshold went back UP from ' + previous + ' to ' + now
-    )
-    previous = now
+test('presets require progressively less activity and invalid settings use normal', () => {
+  assert.ok(motionThreshold('low') > motionThreshold('normal'))
+  assert.ok(motionThreshold('normal') > motionThreshold('high'))
+  for (const value of [null, undefined, NaN, Infinity, 20, 'bad', '__proto__']) {
+    assert.equal(normalizeSensitivity(value), 'normal')
+    assert.equal(motionThreshold(value), motionThreshold('normal'))
   }
 })
 
-test('the same movement that is not enough early is enough late', () => {
-  const movement = 150 // a real turn, just above "light"
-  assert.ok(movement < peakThreshold(min(25)), 'at 25 min a movement like this must not be enough')
-  assert.ok(movement > peakThreshold(min(4)), 'at 4 min the same movement must be enough')
+test('each preset ramps gently across the configured window duration', () => {
+  for (const [preset, start, middle, end] of [
+    ['high', 30, 25, 20], ['normal', 60, 50, 40], ['low', 120, 100, 80],
+  ]) {
+    for (const window of [60, 600, 1800, 3600]) {
+      assert.equal(motionThreshold(preset, window, window), start)
+      assert.equal(motionThreshold(preset, window / 2, window), middle)
+      assert.equal(motionThreshold(preset, 0, window), end)
+      let previous = start
+      for (let remaining = window; remaining >= 0; remaining -= window / 100) {
+        const threshold = motionThreshold(preset, remaining, window)
+        assert.ok(threshold <= previous && threshold >= end)
+        previous = threshold
+      }
+    }
+  }
 })
 
-console.log('\n== the MEAN: fixed at 50 in the last 10 minutes, half the peak before ==')
-
-test('in the last 10 minutes the mean is ALWAYS 50, even as the peak drops', () => {
-  ;[min(10), min(7), min(4), min(2), 60, 30, 0].forEach((s) => {
-    assert.equal(meanThreshold(s), 50, 'at ' + s + 's the mean is not 50')
-  })
+test('the ramp stays bounded before the window and after the deadline', () => {
+  assert.equal(motionThreshold('normal', 3600, 1800), 60)
+  assert.equal(motionThreshold('normal', -60, 1800), 40)
 })
 
-test('the mean of 50 sits ABOVE the measured noise of a still body (9-22)', () => {
-  // On 25 Aug at 08:59 the old rule (half the peak = 20) rang for nothing:
-  // «mean 26 over 20». The measured noise floor reaches 22.
-  assert.ok(meanThreshold(60) > 22, 'the last-minute mean is below the noise: it always rings')
+test('missing or invalid timing falls back to the base preset', () => {
+  for (const preset of ['low', 'normal', 'high']) {
+    const base = motionThreshold(preset)
+    for (const invalid of [undefined, null, NaN, Infinity, -Infinity, '60']) {
+      assert.equal(motionThreshold(preset, invalid, 1800), base)
+      assert.equal(motionThreshold(preset, 60, invalid), base)
+    }
+    assert.equal(motionThreshold(preset, 60, 0), base)
+    assert.equal(motionThreshold(preset, 60, -1), base)
+  }
 })
 
-test('beyond 10 minutes the mean stays at half the peak', () => {
-  assert.equal(meanThreshold(min(15)), peakThreshold(min(15)) / 2)
-  assert.equal(meanThreshold(min(25)), peakThreshold(min(25)) / 2)
+test('the first sample seeds the detector and a constant offset is not movement', () => {
+  const detector = new MotionDetector()
+  assert.equal(sample(detector, [0, 0, 1300], 0), null)
+  for (let time = 200; time <= 5000; time += 200) {
+    const activity = sample(detector, [0, 0, 1300], time)
+    assert.equal(activity.movement, 0)
+    assert.equal(activity.wake, false)
+  }
 })
 
-console.log('\n== robustness: absurd values must not throw the guard wide open ==')
-
-test('NEGATIVE seconds (time already past): the lowest threshold, not zero', () => {
-  assert.equal(peakThreshold(-100), 20)
+test('rotation with unchanged gravity magnitude is detected on every axis', () => {
+  for (const turn of [TURN, [0, TURN[0], TURN[2]], [TURN[2], TURN[0], 0]]) {
+    const detector = new MotionDetector()
+    const rest = turn[2] === 0 ? [1000, 0, 0] : STILL
+    sample(detector, rest, 0)
+    for (let time = 200; time <= 1400; time += 200) {
+      assert.equal(sample(detector, time % 400 ? turn : rest, time).wake, time === 1400)
+    }
+  }
 })
 
-test('non-numeric values: it falls back to the lowest threshold, not to zero', () => {
-  ;[null, undefined, NaN, Infinity, 'hello'].forEach((v) => {
-    const s = peakThreshold(v)
-    assert.ok(s > 0, 'with ' + String(v) + ' the threshold became ' + s + ': any noise would wake you')
-    const m = meanThreshold(v)
-    assert.ok(m > 0, 'with ' + String(v) + ' the mean threshold became ' + m)
-  })
+test('one isolated spike and its quick return produce only one confirmation', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  assert.equal(sample(detector, [0, 0, 3000], 200).wake, false)
+  assert.equal(sample(detector, STILL, 400).confirmations, 1)
+  for (let time = 600; time < 5000; time += 200) {
+    assert.equal(sample(detector, STILL, time).wake, false)
+  }
 })
 
-test('huge times: the highest threshold stays', () => {
-  assert.equal(peakThreshold(min(600)), 500)
+test('small noise does not trigger even at the most sensitive end of the window', () => {
+  const detector = new MotionDetector('high')
+  detector.threshold = motionThreshold('high', 0, 1800)
+  for (let time = 0; time < 180000; time += 200) {
+    const activity = sample(detector, [time % 400 ? 10 : -10, 0, 1000], time)
+    if (activity) assert.equal(activity.wake, false)
+  }
 })
 
-test('the curve can describe itself, so it can be found again in the logs', () => {
-  const d = describeCurve()
-  assert.match(d, /beyond:/)
-  assert.match(d, /mean10m:/)
-  assert.ok(d.length > 10)
+test('confirmations slide across the old 15-reading reset boundary', () => {
+  const detector = new MotionDetector()
+  for (let time = 0; time <= 2400; time += 200) sample(detector, STILL, time)
+  for (let time = 2600; time <= 3800; time += 200) {
+    assert.equal(sample(detector, time % 400 ? TURN : STILL, time).wake, time === 3800)
+  }
 })
 
-console.log('\n----------------------------------------')
-console.log(pass + ' passed, ' + fail + ' failed')
-if (fail) {
-  console.log('\nFAILURES:')
-  failures.forEach((f) => console.log('  - ' + f))
-  process.exit(1)
-}
+test('confirmations expire by elapsed time, even when sampling is slower', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  sample(detector, TURN, 200)
+  sample(detector, STILL, 400)
+  sample(detector, TURN, 800)
+  sample(detector, STILL, 1000)
+  sample(detector, STILL, 1800)
+  sample(detector, STILL, 2600)
+  const activity = sample(detector, TURN, 3200)
+  assert.equal(activity.confirmations, 2, 'the 200 ms reading has expired')
+  assert.equal(activity.wake, false)
+})
+
+test('invalid samples break continuity without creating a movement on recovery', () => {
+  const invalid = [[0, 0, 0], [0, 0, 1], [0, 0, 16384],
+    [NaN, 0, 1000], [0, Infinity, 1000], [0, 0, undefined],
+    ['0', 0, 1000], [null, 0, 1000]]
+  for (const vector of invalid) {
+    const detector = new MotionDetector()
+    sample(detector, STILL, 0)
+    sample(detector, TURN, 200)
+    sample(detector, STILL, 400)
+    assert.equal(sample(detector, vector, 600), null)
+    assert.equal(sample(detector, TURN, 800), null)
+    assert.equal(sample(detector, STILL, 1000).confirmations, 1)
+  }
+})
+
+test('a sensor gap does not join unrelated positions or old confirmations', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  sample(detector, TURN, 200)
+  sample(detector, STILL, 400)
+  assert.equal(sample(detector, TURN, 1600), null)
+  assert.equal(sample(detector, STILL, 1800).confirmations, 1)
+})
+
+test('a clock correction discards previous confirmations', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 1000)
+  sample(detector, TURN, 1200)
+  sample(detector, STILL, 1400)
+  assert.equal(sample(detector, TURN, 500), null)
+  assert.equal(sample(detector, STILL, 700).confirmations, 1)
+})
+
+test('sensitivity changes whether the same small rotation is enough', () => {
+  const turn = [40, 0, Math.sqrt(1000000 - 1600)]
+  for (const sensitivity of ['low', 'normal', 'high']) {
+    const detector = new MotionDetector(sensitivity)
+    sample(detector, STILL, 0)
+    for (let time = 200; time <= 1400; time += 200) {
+      const activity = sample(detector, time % 400 ? turn : STILL, time)
+      assert.equal(activity.wake, time === 1400 && sensitivity === 'high')
+    }
+  }
+})
+
+test('a strong 600 ms burst followed by rest cannot produce three confirmations', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  for (let time = 200; time <= 5000; time += 200) {
+    const vector = time <= 600 && time % 400 ? [0, 0, 3000] : STILL
+    assert.equal(sample(detector, vector, time).wake, false)
+  }
+})
+
+test('smaller repeated 55 mg changes now qualify at normal sensitivity', () => {
+  const detector = new MotionDetector()
+  const turn = [55, 0, Math.sqrt(1000000 - 55 * 55)]
+  sample(detector, STILL, 0)
+  for (let time = 200; time <= 1400; time += 200) {
+    const activity = sample(detector, time % 400 ? turn : STILL, time)
+    assert.ok(activity.movement < 60, 'exercise motion below the former normal threshold')
+    assert.equal(activity.wake, time === 1400)
+  }
+})
+
+test('confirmation spacing is inclusive at 500 ms and cannot be bypassed by rapid samples', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  assert.equal(sample(detector, TURN, 100).confirmations, 1)
+  assert.equal(sample(detector, STILL, 599).confirmations, 1)
+  assert.equal(sample(detector, TURN, 600).confirmations, 2)
+  assert.equal(sample(detector, STILL, 1099).confirmations, 2)
+  assert.equal(sample(detector, TURN, 1100).wake, true)
+})
+
+test('isolated jerks more than three seconds apart never accumulate into a wake', () => {
+  const detector = new MotionDetector()
+  sample(detector, STILL, 0)
+  for (let time = 200; time <= 20000; time += 200) {
+    const vector = time % 4000 === 200 ? TURN : STILL
+    assert.equal(sample(detector, vector, time).wake, false)
+  }
+})

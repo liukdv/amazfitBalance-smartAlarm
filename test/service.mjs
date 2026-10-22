@@ -1,21 +1,18 @@
 // Runs THE REAL app-service, tick by tick, over simulated nights.
 //
 // It is the test that comes closest to what will happen tonight: the service is
-// woken, reads the fake sensors, decides, possibly vibrates and reschedules. If
+// woken, checks the deadline, possibly vibrates and reschedules. If
 // something does not add up here, nobody wakes up.
 import assert from 'node:assert/strict'
 import * as alarmStub from '@zos/alarm'
 import * as fsStub from '@zos/fs'
 import { load, patch, reset } from '../probe/utils/store.js'
-import { readAll, readEvents, COLS } from '../probe/utils/log.js'
+import { readEvents } from '../probe/utils/log.js'
 import { nextOccurrence } from '../probe/utils/schedule.js'
 
 let pass = 0
 let fail = 0
 const failures = []
-
-// Stage codes as the device would give them — deliberately NOT 0..3.
-const C = { WAKE_STAGE: 4, REM_STAGE: 5, LIGHT_STAGE: 6, DEEP_STAGE: 7 }
 
 // Capture the service definition.
 let svc = null
@@ -64,23 +61,8 @@ function pageAlarms() {
   return alarmStub.__scheduled.filter((a) => a.url && !a.file)
 }
 
-function stubAt({ sleeping, stage, now, wear }) {
-  return {
-    sleepingStatus: sleeping,
-    wearStatus: wear === undefined ? 1 : wear, // 1 = on the wrist, still
-    hr: 58,
-    stageConstants: C,
-    stages: stage !== null && stage !== undefined
-      ? [{ start: (now - 300) * 1000, stop: (now - 30) * 1000, model: stage }]
-      : [],
-  }
-}
-
-/**
- * Simulates a night. `stageAt(t)` says which sleep stage you are in at time t.
- * Returns when it vibrated FOR THE FIRST TIME and how many wake-ups it took.
- */
-function runNight({ start, target, windowSec, stageAt, sleepingAt, wearAt, state, maxTicks = 3000 }) {
+/** Simulate service callbacks until the first ring, recording the callback count. */
+function runNight({ start, target, windowSec, state, maxTicks = 3000 }) {
   reset()
   patch({ mode: 'alarm', targetUnix: target, windowSec: windowSec, ...(state || {}) })
   let now = start
@@ -88,12 +70,7 @@ function runNight({ start, target, windowSec, stageAt, sleepingAt, wearAt, state
   let firedAt = null
   while (ticks < maxTicks) {
     setNow(now)
-    globalThis.__stub = stubAt({
-      sleeping: sleepingAt ? sleepingAt(now) : 1,
-      stage: stageAt ? stageAt(now) : null,
-      wear: wearAt ? wearAt(now) : 1,
-      now,
-    })
+    globalThis.__stub = {}
     const before = load().fired || 0
     tick(ticks === 0 ? 'first' : 'tick')
     ticks++
@@ -114,221 +91,41 @@ function runNight({ start, target, windowSec, stageAt, sleepingAt, wearAt, state
 const T = Math.floor(new Date(2026, 7, 22, 7, 30, 0, 0).getTime() / 1000)
 const WIN = 30 * 60
 
-console.log('\n== a whole night: the service always reaches the target ==')
-
-test('deep sleep all night: it vibrates EXACTLY at the target', () => {
-  const r = runNight({
-    start: T - 8 * 3600,
-    target: T,
-    windowSec: WIN,
-    stageAt: () => C.DEEP_STAGE,
-    sleepingAt: () => 1,
+for (const windowSec of [0, 60, WIN]) {
+  test('service reaches the target without sensors; window ' + windowSec + ' seconds', () => {
+    const result = runNight({ start: T - 8 * 3600, target: T, windowSec })
+    assert.ok(result.firedAt >= T && result.firedAt <= T + 60, 'missed or premature alarm')
+    assert.equal(fsStub.__get('probe.csv'), null)
   })
-  assert.ok(r.firedAt !== null, 'IT NEVER VIBRATED: missed alarm')
-  assert.ok(r.firedAt >= T, 'it vibrated before the target even though it was deep sleep')
-  assert.ok(r.firedAt <= T + 60, 'it vibrated ' + (r.firedAt - T) + 's after the target')
-})
+}
 
-test('light sleep inside the window: it goes early, but not too early', () => {
-  const r = runNight({
-    start: T - 8 * 3600,
-    target: T,
-    windowSec: WIN,
-    stageAt: (t) => (t >= T - 12 * 60 ? C.LIGHT_STAGE : C.DEEP_STAGE),
-    sleepingAt: () => 1,
+test('obsolete saved sensor settings cannot cause an early service alarm', () => {
+  const result = runNight({
+    start: T - 3600, target: T, windowSec: WIN,
+    state: { useStages: 1, useLookout: 0, debugLog: 1 },
   })
-  assert.ok(r.firedAt !== null, 'it did not vibrate')
-  assert.ok(r.firedAt <= T, 'it vibrated after the target')
-  assert.ok(r.firedAt >= T - WIN, 'it vibrated BEFORE the window: woken far too early')
-  assert.ok(r.firedAt >= T - 13 * 60, 'it vibrated while still in deep sleep')
+  assert.equal(result.firedAt, T)
+  assert.equal(fsStub.__get('probe.csv'), null)
 })
 
-// ⭐ SIMPLIFIED RULE (22 Aug, evening): awake inside the window = ring AT ONCE,
-// even if you have been awake since arming it. Accepted consequence: arming it
-// less than 30 min before the time rings almost immediately.
-test('WITHOUT the lookout, awake at the start of the window: it vibrates on the FIRST reading', () => {
-  const armedAt = T - 37 * 60 // armed 37 min earlier, like the night of 11 Aug
-  const r = runNight({
-    start: armedAt,
-    target: T,
-    windowSec: WIN,
-    state: { useLookout: 0 },
-    stageAt: () => null,
-    sleepingAt: () => 0, // stays awake for the whole window
-  })
-  assert.ok(r.firedAt !== null, 'it never vibrated')
-  assert.ok(r.firedAt < T, 'awake inside the window it had to go EARLY, not wait for the target')
-  assert.ok(r.firedAt >= T - WIN, 'it vibrated BEFORE the window opened')
-})
-
-test('WITHOUT the lookout, waking up alone inside the window: it catches the awakening', () => {
-  const r = runNight({
-    start: T - 2 * 3600,
-    target: T,
-    windowSec: WIN,
-    state: { useLookout: 0 },
-    stageAt: () => null, // working assumption: stages never available during the night
-    sleepingAt: (t) => (t >= T - 20 * 60 ? 0 : 1), // asleep, wakes at -20 min
-  })
-  assert.ok(r.firedAt !== null, 'it did not vibrate')
-  assert.ok(r.firedAt <= T - 19 * 60, 'it had to catch the spontaneous awakening, it rang at -' + (T - r.firedAt) / 60 + ' min')
-  assert.ok(r.firedAt >= T - WIN, 'it rang outside the window')
-})
-
-// With the simple rule no history is needed: any "awake" reading inside the
-// window rings, even right after a sleep reading.
-test('WITHOUT the lookout, asleep then awake inside the window: it rings when awake', () => {
-  const start = T - 25 * 60
-  const r = runNight({
-    start,
-    target: T,
-    windowSec: WIN,
-    state: { useLookout: 0 },
-    stageAt: () => null,
-    sleepingAt: (t) => (t === start ? 1 : 0), // one sleep reading, then awake
-  })
-  assert.ok(r.firedAt !== null, 'it did not vibrate')
-  assert.ok(r.firedAt < T, 'awake inside the window: it had to ring without waiting for the target')
-  assert.ok(r.firedAt >= T - WIN, 'it rang outside the window')
-})
-
-// The stages stay a viable route only by switching them back on by hand.
-test('with the STAGES switched back on: it falls asleep in light sleep and catches the moment', () => {
-  const r = runNight({
-    start: T - 2 * 3600,
-    target: T,
-    windowSec: WIN,
-    state: { useLookout: 0, useStages: 1 },
-    stageAt: (t) => (t >= T - 15 * 60 ? C.LIGHT_STAGE : null),
-    sleepingAt: (t) => (t >= T - 15 * 60 ? 1 : 0),
-  })
-  assert.ok(r.firedAt !== null)
-  assert.ok(r.firedAt <= T - 13 * 60, 'it had to catch the light sleep as soon as it was classified')
-})
-
-test('sensors mute all night: it vibrates at the target anyway', () => {
-  reset()
-  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
-  let now = T - 3 * 3600
-  let fired = null
-  for (let i = 0; i < 400; i++) {
-    setNow(now)
-    globalThis.__stub = { throwStage: true, throwStatus: true, throwHr: true, throwUpdateInfo: true, throwStageConsts: true }
-    const before = load().fired || 0
-    tick(i === 0 ? 'first' : 'tick')
-    if ((load().fired || 0) > before) {
-      fired = now
-      break
-    }
-    const nx = svcAlarms()[svcAlarms().length - 1]
-    if (!nx) break
-    now = nx.date
-    alarmStub.__reset()
-  }
-  assert.ok(fired !== null, 'BROKEN SENSORS = NO ALARM: that was the defect to avoid')
-  assert.ok(fired >= T && fired <= T + 60, 'vibrated ' + (fired - T) + 's from the target')
-})
-
-test('stage codes unavailable: never early, it vibrates at the target', () => {
-  reset()
-  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
-  let now = T - 20 * 60
-  let fired = null
-  for (let i = 0; i < 60; i++) {
-    setNow(now)
-    // A "light" stage but WITHOUT the device codes: it must not be trusted.
-    globalThis.__stub = {
-      sleepingStatus: 1,
-      hr: 55,
-      stages: [{ start: (now - 300) * 1000, stop: (now - 30) * 1000, model: 2 }],
-    }
-    const before = load().fired || 0
-    tick(i === 0 ? 'first' : 'tick')
-    if ((load().fired || 0) > before) {
-      fired = now
-      break
-    }
-    const nx = svcAlarms()[svcAlarms().length - 1]
-    if (!nx) break
-    now = nx.date
-    alarmStub.__reset()
-  }
-  assert.ok(fired !== null, 'it did not vibrate')
-  assert.ok(fired >= T, 'it vibrated on a stage with UNVERIFIED codes')
-})
-
-test('broken vibrator: the chain does not stall and it records it', () => {
+test('broken vibrator still opens the ring page, records the failure and reschedules', () => {
   reset()
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   setNow(T + 10)
-  globalThis.__stub = { sleepingStatus: 1, stages: [], throwVibrate: true }
+  globalThis.__stub = { throwVibrate: true }
   tick('first')
-  const st = load()
-  assert.ok(String(st.lastReason).indexOf('BUZZ') >= 0, 'the attempt must be recorded')
+  assert.match(load().lastReason, /BUZZ:err/)
+  assert.equal(pageAlarms().length, 1)
+  assert.equal(svcAlarms().length, 1)
 })
 
-console.log('\n== ⭐ THE MOVEMENT ENGINE, over a whole night ==')
-
-// The night as it works since 23 Aug: stages off, wrist movement decides.
-// Movement as seen by the SERVICE only counts while the lookout is not
-// listening: with the lookout on there must be a single decider (23 Aug review).
-test('WITHOUT the lookout, I turn over in bed inside the window: it vibrates then', () => {
-  const turn = T - 18 * 60 // a movement 18 minutes from the alarm
-  const r = runNight({
-    start: T - 6 * 3600,
-    target: T,
-    windowSec: WIN,
-    state: { useLookout: 0 },
-    stageAt: () => null,
-    sleepingAt: () => 1,
-    wearAt: (t) => (t >= turn && t < turn + 60 ? 2 : 1),
-  })
-  assert.ok(r.firedAt !== null, 'it never vibrated')
-  assert.ok(r.firedAt >= turn, 'it vibrated BEFORE the movement: impossible')
-  assert.ok(r.firedAt <= turn + 120, 'it ignored the movement and waited for the time')
-})
-
-test('a night as still as a stone: it vibrates at the exact time anyway', () => {
-  const r = runNight({
-    start: T - 6 * 3600,
-    target: T,
-    windowSec: WIN,
-    stageAt: () => null,
-    sleepingAt: () => 1,
-    wearAt: () => 1, // never a movement
-  })
-  assert.ok(r.firedAt !== null, 'IT DID NOT VIBRATE: missed alarm')
-  assert.ok(r.firedAt >= T, 'it went early for no reason')
-  assert.ok(r.firedAt <= T + 60)
-})
-
-test('movements BEFORE the window: ignored, it does not ring hours early', () => {
-  const r = runNight({
-    start: T - 6 * 3600,
-    target: T,
-    windowSec: WIN,
-    stageAt: () => null,
-    sleepingAt: () => 1,
-    wearAt: (t) => (t < T - WIN ? 2 : 1), // restless all night, then still
-  })
-  assert.ok(r.firedAt >= T, 'it rang because of a movement outside the window')
-})
-
-// ⭐ WITH the lookout (the normal case) the service must never go early: the
-// lookout listens, and the service stays the safety net for the deadline.
-// Without this rule, during the day the service would fire at once and it would
-// be impossible to test the real alarm with a short window.
-test('WITH the lookout: the service never goes early, not even awake and moving', () => {
-  const r = runNight({
-    start: T - 15 * 60,
-    target: T,
-    windowSec: 15 * 60,
-    stageAt: () => null,
-    sleepingAt: () => 0, // awake the whole time
-    wearAt: () => 2, // and moving too
-  })
-  assert.ok(r.firedAt !== null, 'it did not vibrate at all')
-  assert.ok(r.firedAt >= T, 'the service overrode the lookout and went early')
+test('retired monitoring mode cannot start another background chain', () => {
+  reset()
+  patch({ mode: 'monitor', maxTicks: 10 })
+  setNow(T)
+  tick('tick')
+  assert.equal(svcAlarms().length, 0)
+  assert.equal(fsStub.__get('probe.csv'), null)
 })
 
 console.log('\n== the ringing INSISTS: 3 rounds, then it closes ==')
@@ -337,7 +134,7 @@ test('after the first vibration it enters ringing mode and reschedules at +60s',
   reset()
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('tick')
   const st = load()
@@ -356,7 +153,7 @@ test('three rings in total, then idle and no leftover alarms', () => {
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   let now = T + 5
   setNow(now)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('tick') // ring 1
   for (let i = 0; i < 2; i++) {
@@ -366,7 +163,7 @@ test('three rings in total, then idle and no leftover alarms', () => {
     now = nx.date
     alarmStub.__reset()
     setNow(now)
-    globalThis.__stub = stubAt({ sleeping: 1, stage: null, now })
+    globalThis.__stub = {}
     tick('tick') // rings 2 and 3
   }
   const st = load()
@@ -380,7 +177,7 @@ test('STOP halfway through the ringing: no further rings', () => {
   reset()
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('tick') // ring 1, enters ringing mode
   patch({ mode: 'idle', rings: 0 }) // STOP from the page
@@ -399,7 +196,7 @@ test('two rings never closer than 45s (chain and failsafe together)', () => {
   // double buzz.
   patch({ mode: 'ringing', targetUnix: T, windowSec: WIN, rings: 1, fired: 1, lastRingUnix: T + 5 })
   setNow(T + 10)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 10 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('failsafe')
   const st = load()
@@ -415,7 +212,7 @@ test('chain never started, only the failsafe arrives at the target: IT VIBRATES'
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   // No tick ever arrived: the very first wake-up is the failsafe.
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('failsafe')
   const st = load()
@@ -428,7 +225,7 @@ test('failsafe with the alarm ALREADY rung at the time: silence', () => {
   // Healthy conclusion: the ringing happened AT the time or later.
   patch({ mode: 'idle', done: 1, fired: 3, targetUnix: T, lastRingUnix: T + 125 })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 0, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('failsafe')
   assert.equal(load().fired, 3, 'it rang again on an alarm that was already finished')
@@ -441,7 +238,7 @@ test('ringing exhausted BEFORE the time: the failsafe rings again at the deadlin
   reset()
   patch({ mode: 'idle', done: 1, fired: 3, targetUnix: T, lastRingUnix: T - 18 * 60 })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('failsafe')
   const st = load()
@@ -455,7 +252,7 @@ test('ringing exhausted BEFORE the time: the failsafe rings again at the deadlin
 test('corrupted/zeroed state: a live failsafe rings all the same', () => {
   reset() // exactly what load() returns after a corruption
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('failsafe')
   assert.equal(load().fired, 1, 'unreadable state + live failsafe = it rings, never silence')
@@ -469,8 +266,6 @@ test('8 hours with a 30 min window: fewer than 60 wake-ups in total', () => {
     start: T - 8 * 3600,
     target: T,
     windowSec: WIN,
-    stageAt: () => C.DEEP_STAGE,
-    sleepingAt: () => 1,
   })
   assert.ok(r.ticks < 60, 'too many wake-ups in one night: ' + r.ticks)
   assert.ok(r.ticks > 20, 'too few: the window was not covered minute by minute (' + r.ticks + ')')
@@ -482,7 +277,7 @@ test('every wake-up schedules exactly one new one', () => {
   reset()
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
   setNow(T - 3600)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T - 3600 })
+  globalThis.__stub = {}
   for (let i = 0; i < 10; i++) {
     alarmStub.__reset()
     tick('tick')
@@ -493,7 +288,7 @@ test('every wake-up schedules exactly one new one', () => {
 test('idle mode: the service does not re-arm itself', () => {
   reset()
   setNow(T)
-  globalThis.__stub = stubAt({ sleeping: 0, stage: null, now: T })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('tick')
   assert.equal(svcAlarms().length, 0, 'a zombie chain eating battery')
@@ -503,9 +298,9 @@ console.log('\n== traceability: the diary tells the story of the night ==')
 
 test('the diary records the wake-up, the decision and the vibration', () => {
   reset()
-  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
+  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN, debugLog: 1 })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   tick('first')
   const ev = readEvents()
   assert.ok(ev.indexOf('SVC awake') >= 0, 'the wake-up is missing from the diary')
@@ -513,20 +308,12 @@ test('the diary records the wake-up, the decision and the vibration', () => {
   assert.ok(ev.indexOf('SVC VIBRATION') >= 0, 'the vibration is missing')
 })
 
-test('the samples stay readable after a night of writes', () => {
-  const r = runNight({
-    start: T - 8 * 3600,
-    target: T,
-    windowSec: WIN,
-    stageAt: () => C.DEEP_STAGE,
-    sleepingAt: () => 1,
-  })
-  const rows = readAll().split('\n').filter(Boolean)
-  assert.ok(rows.length > 20, 'too few samples: ' + rows.length)
-  assert.ok(rows[0].startsWith('ts_iso'), 'header out of place')
-  rows.slice(1).forEach((l, i) => {
-    assert.ok(l.split(',').length === COLS, 'sample ' + i + ' corrupted: ' + l)
-  })
+test('VERBOSE keeps complete event rows over a night without collecting a CSV', () => {
+  runNight({ start: T - 8 * 3600, target: T, windowSec: WIN, state: { debugLog: 1 } })
+  const rows = readEvents().trimEnd().split('\n')
+  assert.ok(rows.length > 20)
+  for (const row of rows) assert.match(row, /^\d\d:\d\d:\d\d SVC /)
+  assert.equal(fsStub.__get('probe.csv'), null)
 })
 
 console.log('\n== real times: late evening, alarm in the morning ==')
@@ -539,30 +326,9 @@ test('I set 07:30 at 00:20: the target is the next morning, and it gets there', 
     start: bedtime,
     target: target,
     windowSec: WIN,
-    stageAt: () => C.DEEP_STAGE,
-    sleepingAt: () => 1,
   })
   assert.ok(r.firedAt !== null, 'it did not vibrate on the real night')
   assert.ok(Math.abs(r.firedAt - target) <= 60)
-})
-
-test('TONIGHT in full: I arm it awake, I fall asleep, light sleep in the morning', () => {
-  const bedtime = Math.floor(new Date(2026, 7, 23, 0, 30, 0, 0).getTime() / 1000)
-  const target = nextOccurrence(bedtime, 7, 30)
-  const asleepFrom = bedtime + 40 * 60 // falls asleep 40 min after arming it
-  const r = runNight({
-    start: bedtime,
-    target: target,
-    windowSec: WIN,
-    sleepingAt: (t) => (t >= asleepFrom ? 1 : 0),
-    stageAt: (t) => {
-      if (t < asleepFrom) return null
-      return t >= target - 10 * 60 ? C.LIGHT_STAGE : C.DEEP_STAGE
-    },
-  })
-  assert.ok(r.firedAt !== null, 'it did not vibrate')
-  assert.ok(r.firedAt >= target - 11 * 60, 'far too early: ' + (target - r.firedAt) / 60 + ' min before')
-  assert.ok(r.firedAt <= target, 'past the target')
 })
 
 console.log('\n== the "night log" flag ==')
@@ -571,25 +337,65 @@ test('log OFF: no samples and no verbose log, but the alarm RINGS', () => {
   reset()
   patch({ mode: 'alarm', targetUnix: T, windowSec: WIN, debugLog: 0 })
   setNow(T + 5)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: null, now: T + 5 })
+  globalThis.__stub = {}
   alarmStub.__reset()
   tick('first')
   assert.equal(load().fired, 1, 'with the log off the alarm MUST still ring')
-  assert.equal(readAll(), '', 'samples written with the log off')
+  assert.equal(fsStub.__get('probe.csv'), null)
   const ev = readEvents()
   assert.ok(ev.indexOf('SVC VIBRATION') >= 0, 'the vibration must ALWAYS be recorded')
   assert.ok(ev.indexOf('SVC reading') < 0, 'verbose log present with the flag off')
 })
 
-test('log ON (default): every tick writes diary and sample', () => {
+test('VERBOSE writes service state and decisions without health data or CSV', () => {
   reset()
-  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN })
+  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN, debugLog: 1 })
   setNow(T - 600)
-  globalThis.__stub = stubAt({ sleeping: 1, stage: C.DEEP_STAGE, now: T - 600 })
-  alarmStub.__reset()
   tick('first')
-  assert.ok(readAll().split('\n').filter(Boolean).length >= 2, 'sample not written')
-  assert.ok(readEvents().indexOf('SVC reading') >= 0, 'the default verbose log is missing')
+  assert.equal(fsStub.__get('probe.csv'), null)
+  assert.match(readEvents(), /SVC state/)
+  assert.match(readEvents(), /SVC decision/)
+  assert.doesNotMatch(readEvents(), /sleep|stage|wear|heart_rate/i)
+})
+
+test('fresh settings use MINIMAL and preserve an explicitly saved VERBOSE preference', () => {
+  reset()
+  assert.equal(load().debugLog, 0)
+  patch({ debugLog: 1 })
+  patch({ mode: 'alarm', targetUnix: T })
+  assert.equal(load().debugLog, 1)
+})
+
+test('MINIMAL skips diagnostic sensor reads and periodic logs while keeping the service armed', () => {
+  reset()
+  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN, debugLog: 0 })
+  globalThis.__stub = {}
+  for (let i = 0; i < 3; i++) {
+    setNow(T - 600 + i * 60)
+    alarmStub.__reset()
+    tick('tick')
+    assert.equal(load().fired, 0)
+    assert.equal(svcAlarms().length, 1)
+  }
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
+  assert.equal(fsStub.__get('probe.csv'), null)
+  assert.equal(readEvents(), '')
+  setNow(T)
+  tick('failsafe')
+  assert.equal(load().fired, 1)
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
+  assert.match(readEvents(), /SVC VIBRATION/)
+})
+
+test('MINIMAL retains scheduling errors without collecting a diagnostic sensor sample', () => {
+  reset()
+  patch({ mode: 'alarm', targetUnix: T, windowSec: WIN, debugLog: 0 })
+  setNow(T - 600)
+  globalThis.__stub = { throwAlarmSet: true }
+  tick('tick')
+  assert.match(readEvents(), /SVC reschedule ERROR/)
+  assert.equal(fsStub.__get('probe.csv'), null)
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
 })
 
 restoreNow()

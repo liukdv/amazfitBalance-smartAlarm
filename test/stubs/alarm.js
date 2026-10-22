@@ -15,6 +15,7 @@ export function __reset() {
 export function set(opts) {
   const s = globalThis.__stub || {}
   if (s.throwAlarmSet) throw new Error('alarm boom')
+  if (s.rejectAlarm && s.rejectAlarm(opts)) return 0
   const id = seq++
   __scheduled.push({ id, ...opts })
   return id

@@ -1,14 +1,43 @@
 // Alarm time arithmetic. Pure maths, testable without a watch.
 
-// The next occurrence of HH:MM. If the time has already passed today, it is
-// tomorrow: at 23:50 you set "07:30" meaning tomorrow morning, not this morning.
-export function nextOccurrence(nowUnix, h, m) {
+// Day numbers follow Date.getDay(); the UI starts the week on Monday.
+export const WEEKDAYS = [
+  { day: 1, label: 'Mon' }, { day: 2, label: 'Tue' }, { day: 3, label: 'Wed' },
+  { day: 4, label: 'Thu' }, { day: 5, label: 'Fri' }, { day: 6, label: 'Sat' },
+  { day: 0, label: 'Sun' },
+]
+
+/** Validate and deduplicate selected weekdays; an empty list means once. */
+export function normalizeDays(days = []) {
+  if (!Array.isArray(days) || days.some((day) => !Number.isInteger(day) || day < 0 || day > 6)) {
+    throw new Error('Invalid repeat days')
+  }
+  return WEEKDAYS.filter(({ day }) => days.includes(day)).map(({ day }) => day)
+}
+
+/** Describe a saved recurrence in the editor and the alarm list. */
+export function fmtDays(days = []) {
+  const selected = normalizeDays(days)
+  if (!selected.length) return 'Once'
+  if (selected.length === 7) return 'Every day'
+  if (selected.join(',') === '1,2,3,4,5') return 'Weekdays'
+  if (selected.join(',') === '6,0') return 'Weekends'
+  return WEEKDAYS.filter(({ day }) => selected.includes(day)).map(({ label }) => label).join(' ')
+}
+
+/** Find the next local HH:MM on an allowed day, strictly after nowUnix. */
+export function nextOccurrence(nowUnix, h, m, days = []) {
+  const selected = normalizeDays(days)
   const now = new Date(nowUnix * 1000)
-  const t = new Date(now.getTime())
-  t.setHours(h, m, 0, 0)
-  let target = Math.floor(t.getTime() / 1000)
-  if (target <= nowUnix) target += 24 * 3600
-  return target
+  for (let offset = 0; offset <= 7; offset++) {
+    const t = new Date(now.getTime())
+    // Advance calendar dates, not 86400-second intervals across DST changes.
+    t.setDate(now.getDate() + offset)
+    t.setHours(h, m, 0, 0)
+    const target = Math.floor(t.getTime() / 1000)
+    if (target > nowUnix && (!selected.length || selected.includes(t.getDay()))) return target
+  }
+  throw new Error('Cannot find next alarm day')
 }
 
 export const TICK_IN_WINDOW = 60

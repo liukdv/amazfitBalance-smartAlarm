@@ -1,35 +1,4 @@
 // STUBS of the Zepp APIs for the tests under Node. Driven by globalThis.__stub.
-export class Sleep {
-  updateInfo() {
-    const s = globalThis.__stub || {}
-    s.updateInfoCalls = (s.updateInfoCalls || 0) + 1
-    if (s.throwUpdateInfo) throw new Error('updateInfo boom')
-  }
-  getSleepingStatus() {
-    const s = globalThis.__stub || {}
-    if (s.throwStatus) throw new Error('status boom')
-    return s.sleepingStatus
-  }
-  getStage() {
-    const s = globalThis.__stub || {}
-    if (s.throwStage) throw new Error('stage boom')
-    return s.stages
-  }
-  getInfo() {
-    const s = globalThis.__stub || {}
-    if (s.throwInfo) throw new Error('info boom')
-    return s.info
-  }
-  // The stage codes as the device would give them. The tests set them to values
-  // that are NON-contiguous and different from 0..3 on purpose: nothing must be
-  // hardcoded in the source.
-  getStageConstantObj() {
-    const s = globalThis.__stub || {}
-    if (s.throwStageConsts) throw new Error('stageConsts boom')
-    return s.stageConstants
-  }
-}
-
 // Accelerometer: values in thousandths of g. With a still wrist the magnitude is
 // gravity, ~1000 (measured on the device on 23 Aug); shaking the arm it reaches
 // 2765. The stub returns whatever the test puts in __stub.acc.
@@ -48,28 +17,6 @@ export class Accelerometer {
     const s = globalThis.__stub || {}
     if (s.throwAcc) throw new Error('acc boom')
     return s.acc === undefined ? { x: 0, y: 0, z: 1000 } : s.acc
-  }
-}
-
-// Wear: 0 not worn, 1 still on the wrist, 2 MOVING, 3 uncertain.
-export class Wear {
-  getStatus() {
-    const s = globalThis.__stub || {}
-    if (s.throwWear) throw new Error('wear boom')
-    return s.wearStatus === undefined ? 1 : s.wearStatus
-  }
-  onChange() {}
-  offChange() {}
-}
-
-export class HeartRate {
-  getLast() {
-    const s = globalThis.__stub || {}
-    if (s.throwHr) throw new Error('hr boom')
-    return s.hr
-  }
-  getCurrent() {
-    return (globalThis.__stub || {}).hr
   }
 }
 

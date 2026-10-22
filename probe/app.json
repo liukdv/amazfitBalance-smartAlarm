@@ -1,31 +1,41 @@
 {
   "configVersion": "v3",
   "app": {
-    "appId": 1043001,
+    "appId": 1132182,
     "appName": "SmartAlarm",
     "appType": "app",
-    "version": { "code": 1, "name": "0.1.0" },
+    "version": { "code": 20, "name": "0.5.15" },
     "icon": "icon.png",
     "vender": "stefanopochet",
     "description": "Smart alarm: wakes you on wrist movement inside a window before the set time"
   },
   "permissions": [
-    "data:user.hd.sleep",
-    "data:user.hd.heart_rate",
     "device:os.local_storage",
     "device:os.alarm",
     "device:os.bg_service",
-    "device:os.accelerometer"
+    "device:os.accelerometer",
+    "device:os.notification"
   ],
   "runtime": {
     "apiVersion": { "compatible": "3.0.0", "target": "4.0.0", "minVersion": "3.0.0" }
   },
   "targets": {
+    "balance": {
+      "module": {
+        "page": { "pages": ["page/index", "page/edit", "page/debug", "page/ring", "page/lookout"] },
+        "app-service": { "services": ["app-service/probe"] }
+      },
+      "platforms": [
+        { "name": "Monaco", "deviceSource": 8519936 },
+        { "name": "MonacoWN", "deviceSource": 8519937 },
+        { "name": "MonacoW", "deviceSource": 8519939 }
+      ],
+      "designWidth": 480
+    },
     "active2-round": {
       "module": {
-        "page": { "pages": ["page/index", "page/debug", "page/ring", "page/lookout"] },
-        "app-service": { "services": ["app-service/probe"] },
-        "app-side": { "path": "app-side/index" }
+        "page": { "pages": ["page/index", "page/edit", "page/debug", "page/ring", "page/lookout"] },
+        "app-service": { "services": ["app-service/probe"] }
       },
       "platforms": [
         { "name": "Milan", "deviceSource": 8913152 },
@@ -41,9 +51,8 @@
     },
     "active2-square": {
       "module": {
-        "page": { "pages": ["page/index", "page/debug", "page/ring", "page/lookout"] },
-        "app-service": { "services": ["app-service/probe"] },
-        "app-side": { "path": "app-side/index" }
+        "page": { "pages": ["page/index", "page/edit", "page/debug", "page/ring", "page/lookout"] },
+        "app-service": { "services": ["app-service/probe"] }
       },
       "platforms": [
         { "name": "Rome64", "deviceSource": 10223872 },

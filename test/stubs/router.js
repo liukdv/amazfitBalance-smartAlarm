@@ -3,6 +3,7 @@ export function push(opts) {
   const s = globalThis.__stub || {}
   if (s.throwPush) throw new Error('router unavailable')
   s.pushed = (s.pushed || []).concat([opts && opts.url])
+  s.lastPush = opts
 }
 
 export function launchApp() {}
@@ -10,6 +11,7 @@ export function replace(opts) {
   const s = globalThis.__stub || {}
   if (s.throwReplace) throw new Error('replace unavailable')
   s.replaced = (s.replaced || []).concat([opts && opts.url])
+  s.lastReplace = opts
 }
 export function back() {
   const s = globalThis.__stub || {}

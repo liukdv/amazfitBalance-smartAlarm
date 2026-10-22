@@ -1,4 +1,4 @@
-// Checks the built package: that both targets are there, that the app-service is
+// Checks the built package: that all targets are there, that the app-service is
 // inside (the build does NOT fail if it is missing) and that the test stubs did
 // not end up in the real package.
 import { execFileSync } from 'node:child_process'
@@ -35,8 +35,8 @@ mkdirSync(WORK, { recursive: true })
 execFileSync('unzip', ['-o', '-q', zab, '-d', join(WORK, 'zab')])
 
 const zpks = readdirSync(join(WORK, 'zab')).filter((f) => f.endsWith('.zpk'))
-if (zpks.length === 2) ok('two targets in the package (round + square)')
-else bad('expected 2 targets, found ' + zpks.length)
+if (zpks.length === 3) ok('three targets in the package (Balance + Active 2 round + square)')
+else bad('expected 3 targets, found ' + zpks.length)
 
 const seenWidths = new Set()
 
@@ -59,6 +59,9 @@ zpks.forEach((zpk, i) => {
   if (existsSync(join(dev, 'page', 'index.bin'))) ok(label + ': alarm page present')
   else bad(label + ': alarm page missing')
 
+  if (existsSync(join(dev, 'page', 'edit.bin'))) ok(label + ': time editor present')
+  else bad(label + ': TIME EDITOR MISSING')
+
   if (existsSync(join(dev, 'page', 'debug.bin'))) ok(label + ': diagnostics page present')
   else bad(label + ': DIAGNOSTICS PAGE MISSING (tonight’s tests live there)')
 
@@ -74,17 +77,28 @@ zpks.forEach((zpk, i) => {
   else bad(label + ': wrong app-service declaration')
 
   const perms = cfg.permissions || []
-  ;['data:user.hd.sleep', 'device:os.alarm', 'device:os.bg_service'].forEach((p) => {
+  ;['device:os.local_storage', 'device:os.alarm', 'device:os.bg_service', 'device:os.accelerometer', 'device:os.notification'].forEach((p) => {
     if (perms.includes(p)) ok(label + ': permission ' + p)
     else bad(label + ': missing permission ' + p)
   })
 
+  if (perms.some((p) => p.startsWith('data:'))) bad(label + ': unused health-data permission')
+  else ok(label + ': no health-data permissions')
+
   const nSources = (cfg.platforms || []).length
   if (nSources > 0) ok(label + ': ' + nSources + ' hardware variants covered')
   else bad(label + ': no hardware variant')
+
+  if (w === 480) {
+    const sources = (cfg.platforms || []).map((p) => p.deviceSource)
+    if (sources.length === 3 && [8519936, 8519937, 8519939].every((id) => sources.includes(id)))
+      ok(label + ': original Balance hardware variants covered')
+    else bad(label + ': incorrect Balance hardware variants')
+  }
 })
 
-if (seenWidths.has(466) && seenWidths.has(390)) ok('both round (466) and square (390) covered')
+if (seenWidths.has(480) && seenWidths.has(466) && seenWidths.has(390))
+  ok('Balance (480), Active 2 round (466) and square (390) covered')
 else bad('widths found: ' + [...seenWidths].join(', '))
 
 // The test stubs live in test/stubs: if zeus ever bundled them, the app on the

@@ -15,17 +15,17 @@ import * as hmUI from '@zos/ui'
 import { BasePage } from '@zeppos/zml/base-page'
 import * as alarmMgr from '@zos/alarm'
 import { getDeviceInfo } from '@zos/device'
-import { readAll, logEvent, clear, diskSizes } from '../utils/log'
-import { stageConsts, wakeableModels } from '../utils/sample'
-import { load, patch, reset } from '../utils/store'
+import { logEvent, clear, diskSizes } from '../utils/log'
+import { load, patch, reset, save } from '../utils/store'
+import { normalizeSensitivity, motionThreshold } from '../utils/threshold'
+import { listAlarms, stopAllAlarms, alarmEnabled } from '../utils/alarms'
 import { wakeBuzz } from '../utils/vibrate'
 import { fmtTime } from '../utils/schedule'
-import { sendAll } from '../utils/uplog'
 
 // Version VISIBLE on screen: on 23 Aug minutes were lost looking for a button
 // that only existed in the following build — the QR changes on every deploy and
 // the old one installs the old package. To be bumped on every change delivered.
-const BUILD = 'v14'
+const BUILD = 'v0.5.15'
 
 function screen() {
   try {
@@ -54,18 +54,6 @@ function showErr(where, e) {
     if (errText)
       errText.setProperty(hmUI.prop.TEXT, where + ': ' + (e && e.message ? e.message : String(e)))
   } catch (e2) {}
-}
-
-function samples() {
-  try {
-    const s = readAll()
-    if (!s) return 0
-    let n = 0
-    for (let i = 0; i < s.length; i++) if (s[i] === '\n') n++
-    return Math.max(0, n - 1)
-  } catch (e) {
-    return -1
-  }
 }
 
 function cancelAll() {
@@ -109,7 +97,7 @@ Page(
       } catch (e) {}
       try {
         if (this.vlog)
-          logEvent('DEBUG opened', { w, h, stageConsts: stageConsts(), wakeable: wakeableModels() })
+          logEvent('DEBUG opened', { w, h })
       } catch (e) {}
 
       const BW = Math.round(w * 0.8)
@@ -194,7 +182,6 @@ Page(
         return ref
       }
 
-      btn('SEND LOGS', 0x0277bd, () => this.sendLog('manual'))
       btn('STATE', 0x333333, () => this.showState())
 
       // ⭐ THE WINDOW WIDTH (23 Aug). There are no "test buttons" any more: a test
@@ -220,6 +207,22 @@ Page(
         } catch (e) {}
       })
 
+      const sensitivityLabel = () => 'SENSITIVITY: ' + normalizeSensitivity(load().motionSensitivity).toUpperCase()
+      const sensitivityBtn = btn(sensitivityLabel(), 0x4527a0, () => {
+        const settings = load()
+        const choices = ['low', 'normal', 'high']
+        const current = normalizeSensitivity(settings.motionSensitivity)
+        const next = choices[(choices.indexOf(current) + 1) % choices.length]
+        if (!save({ ...settings, motionSensitivity: next })) {
+          logEvent('SENSITIVITY save ERROR', { requested: next })
+          throw new Error('Cannot save sensitivity')
+        }
+        if (sensitivityBtn) sensitivityBtn.setProperty(hmUI.prop.TEXT, sensitivityLabel())
+        say('sensitivity ' + next)
+        detail('HIGH: smaller movements\nApplies when listening next starts')
+        logEvent('SENSITIVITY changed', { sensitivity: next, threshold: motionThreshold(next) })
+      })
+
       // ⭐ TEST SCREEN: the page that listens to the movement has two outfits.
       // At night it is nearly invisible (very dark grey, brightness at minimum)
       // so as not to wake anyone or light up the room; during tests it becomes
@@ -241,9 +244,7 @@ Page(
 
       btn('BUZZ', 0x8e44ad, () => say('alarm: ' + wakeBuzz()))
 
-      // Diary verbosity. VERBOSE (default during the analysis phase): every tick
-      // writes reading + decision + sample. MINIMAL: only arming, rings and
-      // errors — for when the alarm is just there to be used.
+      // VERBOSE adds service details and movement summaries to local events.
       const logBtn = btn('LOG: ' + (this.vlog ? 'VERBOSE' : 'MINIMAL'), 0x00695c, () => {
         this.vlog = !(load().debugLog === 1)
         patch({ debugLog: this.vlog ? 1 : 0 })
@@ -251,10 +252,11 @@ Page(
           if (logBtn) logBtn.setProperty(hmUI.prop.TEXT, 'LOG: ' + (this.vlog ? 'VERBOSE' : 'MINIMAL'))
         } catch (e) {}
         say('log ' + (this.vlog ? 'VERBOSE' : 'MINIMAL'))
-        detail(this.vlog ? 'every tick writes diary + sample' : 'only arming, rings, errors')
+        detail(this.vlog ? 'service details + movement summaries' : 'only arming, rings, errors')
       })
 
       btn('STOP EVERYTHING', 0x5e1b1b, () => {
+        stopAllAlarms()
         const n = cancelAll()
         patch({ mode: 'idle', rings: 0 })
         say('STOPPED · ' + n + ' cancelled')
@@ -266,15 +268,16 @@ Page(
       // uploads), state back to defaults. The before/after sizes end up on
       // screen: the proof that everything really went back to 0.
       btn('FULL RESET', 0x7f1d1d, () => {
+        stopAllAlarms(true)
         const before = diskSizes()
         const n = cancelAll()
         clear()
         reset()
+        if (sensitivityBtn) sensitivityBtn.setProperty(hmUI.prop.TEXT, sensitivityLabel())
         const after = diskSizes()
         say('RESET · ' + n + ' alarms cancelled')
         detail(
-          'diary ' + before.events + '→' + after.events + ' bytes\n' +
-            'samples ' + before.csv + '→' + after.csv + ' bytes'
+          'diary ' + before.events + '→' + after.events + ' bytes'
         )
       })
 
@@ -289,46 +292,31 @@ Page(
 
     showState() {
       try {
-        const s = load()
+        const alarms = listAlarms()
+        const active = alarms.filter(alarmEnabled)
+          .sort((a, b) => a.targetUnix - b.targetUnix)
+        const s = { ...load(), ...(active[0] || alarms[0] || {}) }
         const now = Math.floor(Date.now() / 1000)
-        const ticks = (s.ticks || 0) + (s.maxTicks ? '/' + s.maxTicks : '')
+        const ticks = s.ticks || 0
         // The version sits in the status line (the title is covered by it
         // immediately): it is the first place anyone looks.
         let head = BUILD + ' · mode: ' + s.mode
         if (s.mode === 'idle' && s.done) head = s.fired ? 'COMPLETED: it vibrated' : 'COMPLETED'
         if (s.mode === 'alarm') head += ' · ' + fmtTime(s.alarmH, s.alarmM)
         if (s.mode === 'ringing') head = 'RINGING (' + (s.rings || 0) + ')'
-        say(head + '\nticks ' + ticks + ' · buzzes ' + (s.fired || 0) +
+        say(head + ' · ' + active.length + '/' + alarms.length + ' on\nticks ' + ticks + ' · buzzes ' + (s.fired || 0) +
           ' · log ' + (s.debugLog !== 0 ? 'on' : 'off'))
         // The ON-DISK size of the log files: it is the hidden cost of every write
         // (23 Aug), so it is kept in sight from here.
         const d = diskSizes()
         detail(
-          'samples ' + samples() + ' · disk ev ' + d.events + 'B csv ' + d.csv + 'B' +
+          'diary ' + d.events + ' bytes' +
             (s.mode === 'alarm' && s.targetUnix ? '\nrings at ' + clock(s.targetUnix) : '') +
             '\n' + String(s.lastReason || '').slice(0, 70)
         )
       } catch (e) {
         showErr('state', e)
       }
-    },
-
-    // The actual upload lives in utils/uplog (shared with the main page's
-    // auto-upload): only the on-screen wording stays here.
-    sendLog(why) {
-      say('uploading...')
-      sendAll(this, why, (outcome) => {
-        if (outcome.indexOf('ok') === 0) {
-          say('LOGS SENT ' + outcome.slice(3))
-          detail('local files cleared')
-        } else if (outcome === 'no channel') {
-          say('no channel')
-          detail('app not wrapped in BaseApp?')
-        } else {
-          say('upload failed')
-          detail('is the phone reachable?')
-        }
-      })
     },
 
     onDestroy() {},

@@ -2,35 +2,34 @@
 
 A smart alarm for the **Amazfit Active 2** (Zepp OS 5), built as a Zepp mini app.
 
+Also includes an **Amazfit Balance (original, round, 480×480)** target for Zepp OS 4.
+Balance support is experimental: packaging is configured, but alarm delivery,
+movement thresholds and battery use still need testing on a real Balance.
+
 Amazfit removed the smart alarm from the Zepp app. This project rebuilds it: you
 set a time, and in the 30 minutes before it the watch listens to your wrist and
-rings at the first real movement — the moment you are already surfacing out of
-sleep. If you never move, it rings at the exact time, like an ordinary alarm.
+rings on confirmed wrist activity. Movement is a proxy for a favorable wake-up
+moment, not a reliable identification of a sleep stage. If no activity qualifies,
+it rings at the exact time, like an ordinary alarm.
 
 Status: **working**. It runs on a real watch and has been waking a real person up
-since 23 August 2026. 225 tests across 8 suites cover the logic.
+since 23 August 2026. Tests across 9 suites cover the logic; the new motion
+sensitivity presets still need calibration on the original Balance.
 
 ---
 
-## Why movement and not sleep stages
+## Sensors and permissions
 
-The obvious idea is to read the sleep stages and ring during light sleep. It does
-not work, for a structural reason: the staging algorithm classifies a minute
-using the **two following minutes** as well, so the stretch in progress is always
-provisionally marked "light" and rewritten afterwards. Read in real time, the
-stages lie.
-
-Every smart alarm that actually works looks at **movement** instead. So does this
-one. Sleep stages are still read and written to the log every minute — so each
-night leaves behind the evidence to re-examine the question — but they decide
-nothing. The old stage route is preserved behind a switch (`useStages`).
+The alarm uses wrist acceleration and the configured time window. It does not
+read sleep stages, heart rate, breathing or wear status, including in VERBOSE
+mode. The app requests no health-data permissions. It retains permissions for
+local storage, alarms, background services, the accelerometer and notifications.
 
 ## The problem this had to solve, and the trick that solved it
 
 The accelerometer — the only sensor that really feels movement — is **forbidden
-to background services** on Zepp OS. And `Wear.getStatus()`, which a background
-service may read, never reports "moving" on this watch (tested: 161 readings with
-the arm shaking, always "still"). In the background, the app is blind.
+to background services** on Zepp OS, so movement detection runs in a foreground
+page while the background service enforces the alarm deadline.
 
 The way around it is the **lookout**: you do not need to see all night, only
 during the good half hour. When the window opens the system opens a page
@@ -39,17 +38,30 @@ brightness at the minimum — invisible next to a sleeping person — and there 
 accelerometer works, sampling the wrist 5 times a second. At the first real
 movement it hands over to the ring page.
 
-## The threshold curve
+## Movement sensitivity through the window
 
-A still wrist reads ~1000 (that is gravity: the unit is thousandths of g). The
-signal is the **deviation** from it: a light turn peaks around 100, a decisive
-movement around 500, and the noise floor of a motionless body sits at 9-22.
+Activity is the magnitude of the change between consecutive XYZ accelerometer
+vectors, sampled at 5 Hz. This includes wrist rotations even when total
+acceleration stays near gravity. A constant sensor offset is not movement.
 
-The threshold to beat **drops as the alarm time approaches** — half an hour out
-it takes a significant movement, in the last minute almost anything counts. Two
-criteria run in parallel: a **peak** (three readings above the threshold within
-three seconds — the jolt of turning over) and a **mean** over the last two
-minutes (continuous restlessness the peak never sees). See
+The threshold decreases gradually from **120% to 80% of the selected preset**
+over the configured smart window, making the alarm slightly less sensitive at
+its start and more sensitive near the target time. Three readings above the
+current threshold are required within a sliding three-second interval, with at
+least 500 ms between confirmations so one short twitch is insufficient. The first valid sample
+only establishes a baseline; invalid readings or a gap longer than one second
+reset the baseline and confirmations. The exact-time alarm remains independent.
+
+In **debug → SENSITIVITY**, tap to cycle NORMAL → HIGH → LOW. HIGH requires
+smaller movements. The presets use 50, 25 and 100 mg respectively, as initial
+values to test on the watch rather than validated sleep-stage boundaries.
+NORMAL therefore goes from 60 mg at the start to 50 mg halfway through and
+40 mg near the deadline. The ramp uses the alarm's own window and target time,
+including when listening starts late. The choice is saved globally and applies
+when the next listening window opens.
+Old numeric thresholds from earlier versions are ignored. TEST SCREEN shows
+current movement, the current threshold and confirmations; the log records the
+metric, preset, threshold and minute summaries. See
 [`probe/utils/threshold.js`](probe/utils/threshold.js).
 
 ## Three safety nets
@@ -71,7 +83,7 @@ still rings.
 ## Commands
 
 ```bash
-npm test      # 225 tests across 8 suites against stubs of the Zepp APIs
+npm test      # 9 suites against stubs of the Zepp APIs
 ```
 
 ```bash
@@ -89,6 +101,19 @@ contains everything), `npm run check` (test + build + verify), `npm run bridge`
 
 ## Installing on the watch
 
+Install the build tools and dependencies once (Node.js 20+ and `unzip` required):
+
+```bash
+npm install -g @zeppos/zeus-cli
+npm install
+npm ci --prefix probe
+zeus login
+```
+
+`npm run deploy` selects the original **Amazfit Balance** by default.
+For Active 2 round, use `npm run deploy -- "Amazfit Active 2 (Round)"`;
+the existing Active 2 targets remain available.
+
 1. In the Zepp app: **Profile → Settings → About** → tap the Zepp icon 7 times
    (once, to unlock developer mode).
 2. `npm run deploy` → produces the QR as a PNG.
@@ -101,48 +126,93 @@ with your own.
 
 ## Using it
 
-The main screen is a plain alarm clock: the time in large type, the state below
-it, and one gesture — **SET** when it is off, **DELETE** when it is armed. Two
-buttons adjust the time (+1 hour, +1 minute, both wrapping). Changing the time
-switches the alarm off, so what you see is always what will ring.
+The main screen lists saved alarms, each with its own **ON/OFF** button.
+Tap the time to edit it, or **+ ADD ALARM** to create another. Swipe the hour
+and minute wheels; alternatively, select **HOUR** or **MINUTE** and turn the
+crown. A bottom strip follows the display edge, split vertically into **DELETE**
+on the left (red) and **SAVE** on the right (green). Swipe back to discard the
+draft. **DELETE** removes only that alarm. New alarms are enabled; editing preserves ON/OFF.
 
-When it rings: one big **STOP** button. It insists — three rounds a minute apart —
-because a single buzz during sleep wakes nobody.
+Use **DAYS** to select any combination of Monday through Sunday, then **DONE**
+and **SAVE**. Beside Sunday, **Weekdays** selects Monday–Friday and **Weekend**
+selects Saturday–Sunday, replacing the current selection. You can then adjust
+individual days. Selected days repeat every week; no selected days means **Once**,
+the default for a new alarm. Deselect all days to return to a single-use alarm.
+Day selection stays in the draft until SAVE; swiping back
+discards both time and day changes. Existing alarms remain single-use until you select days.
 
-Behind `debug` there is a diagnostics screen: window width, test screen, log
-verbosity, a manual buzz, and a full reset. **A test is a real alarm with a short
+Use **BEDTIME** to configure a reminder for that alarm. Switch **REMINDER** to
+**ON**, choose the duration using **HOURS** and **MINUTES** with the same wheels
+or crown, then **DONE → SAVE**. The range is 1 minute to 23 hours 59 minutes; OFF
+is the default. These are duration fields, not a bedtime clock. For example,
+07:30 with an 08:00 offset sends **Time to sleep** at 23:30 the previous evening.
+In both the day and reminder selectors, **DONE** fills the bottom strip.
+Swiping back discards the draft, including the reminder setting.
+
+The reminder is a local watch notification, with a gentle vibration request,
+scheduled from the alarm's final time. It needs the `device:os.notification`
+permission and does not require the phone. Delivery and vibration still depend
+on the watch firmware and notification settings. Repeat days apply to the
+wake-up day: a Monday alarm can remind you on Sunday. Each repeated occurrence
+schedules its own reminder; OFF/delete cancels future reminders for that alarm.
+If its reminder time has already passed when an occurrence is scheduled, that
+reminder is skipped. Callbacks more than 15 minutes late are also ignored.
+Offsets use elapsed hours, including across daylight-saving changes.
+
+If scheduling the reminder fails, the editor reports it while keeping the
+wake-up alarm ON. For a quick device test, use a wake-up time five minutes ahead
+with a three-minute bedtime offset and a smart window of zero.
+
+For a recurring alarm, **STOP** dismisses the current occurrence and schedules
+the next selected day, even when the smart alarm rang before its deadline.
+**OFF** in the list disables the entire recurrence; switching it on again keeps
+the selected days. If nobody presses STOP, the service schedules the next
+occurrence ten minutes after the deadline, allowing the vibration rounds to finish.
+The smart-window setting in debug applies when an alarm is enabled or saved;
+automatic repetitions preserve that alarm's window.
+
+When it rings, the big **STOP** button stops that alarm only. Other alarms retain
+their own service and exact-time failsafes. Overlapping smart windows share the
+one foreground accelerometer page: the earliest alarm is monitored first, and
+STOP hands over to the next open window. Each alarm retains its own deadline.
+The service still insists for three rounds a minute apart.
+
+Version 0.5.0 / diagnostics v18 adds a separate bedtime reminder per alarm.
+The automated tests and Zeus build do not validate firmware behavior: crown,
+scrolling, recurring and simultaneous alarms, notifications, and background wake-up still need
+a test on the physical Balance.
+
+Swipe left on the alarm list to open diagnostics: window width, sensitivity, test screen, log
+verbosity, a manual buzz, and a full reset. New settings default to MINIMAL; an
+existing VERBOSE preference is preserved until changed here. **A test is a real alarm with a short
 window** — set the window to 1 minute, go back, set the alarm two minutes ahead.
 There is deliberately no separate "test mode": two routes can drift apart.
 
-## Getting the logs off the watch
+## Local diagnostics
 
-There is no console on a watch, so the debugging is designed into the app: it
-writes a sample CSV and an event diary, and ships them to a small HTTP receiver
-through the phone. [`server/`](server/) holds that receiver (a ~100-line Python
-script, a systemd unit, and an nginx snippet); `tools/wlog.mjs` reads what
-arrived. Before using it, put your own host and a random token into
-[`probe/app-side/index.js`](probe/app-side/index.js) and
-[`server/wlog.service`](server/wlog.service) — the placeholders are inert.
-
-If you do not want any of this, ignore `server/`: the alarm works without it.
+Logs stay on the watch; the app does not upload them or run a phone-side service.
+The alarm list does not read log contents or sample sleep data when it opens.
+MINIMAL keeps alarm events and errors; VERBOSE adds service details and movement
+summaries. STATE shows the event log size, and FULL RESET clears it together
+with the saved alarms and any retired sample CSV. The 16 KiB size cap discards
+the oldest log entries and limits the amount rewritten during UI actions.
 
 ## Layout
 
 ```
 probe/
-  app.json              targets: round (466px, 8 variants) and square (390px, 3 variants)
+  app.json              targets: Balance (480px), Active 2 round (466px) and square (390px)
   app.js                app entry point
-  page/index.js         main screen: pick the time, SET / DELETE
+  page/index.js         saved alarms and independent ON/OFF controls
+  page/edit.js          time wheels, crown, repeat days, save and delete
   page/lookout.js       the lookout: listens to the accelerometer inside the window
   page/ring.js          the ring page: the only place vibration reaches the motor
   page/debug.js         diagnostics
   app-service/probe.js  background service, re-arms itself every tick
-  app-side/index.js     runs inside the Zepp app on the phone: ships the logs out
   utils/                decision, thresholds, scheduling, storage, logging
-test/                   8 suites run against the real sources
+test/                   9 suites run against the real sources
 test/stubs/             stubs of the @zos APIs
-tools/                  build, package verification, QR, log reading
-server/                 the log receiver
+tools/                  build, package verification and QR
 ```
 
 ## Decisions worth knowing about
@@ -172,6 +242,10 @@ its order of magnitude.
 
 - Tested on one device: an Amazfit Active 2 (round). The square target builds but
   has never been installed.
+- The original Balance target includes deviceSource 8519936, 8519937 and 8519939.
+  It requires API_LEVEL 3.0 or newer; Zepp OS 4 on Balance supports this.
+  Before relying on it, test movement-triggered waking and the exact-time
+  fallback with a short window, including while Sleep Mode is enabled.
 - Battery cost of the lookout (screen on, accelerometer at 5 Hz, up to 30 min a
   night) is noticeable but was acceptable in practice; it has not been measured
   rigorously.

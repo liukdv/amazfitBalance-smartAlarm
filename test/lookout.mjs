@@ -2,12 +2,13 @@
 // to the accelerometer — the only sensor that really feels movement, and one
 // that only works with the app in the foreground.
 //
-// The unit of the values is thousandths of g. With a still wrist the magnitude
-// is ~1000 (gravity); the useful signal is how far it DEVIATES from 1000.
+// Activity is the change between XYZ vectors in mg, including rotations that
+// keep their magnitude near 1000. Sensitivity gently increases through the window.
 import assert from 'node:assert/strict'
 import * as uiStub from '@zos/ui'
 import * as fsStub from '@zos/fs'
-import { load, patch, reset } from '../probe/utils/store.js'
+import { patch, reset } from '../probe/utils/store.js'
+import { initAlarms, getAlarm } from '../probe/utils/alarms.js'
 import { readEvents } from '../probe/utils/log.js'
 
 let pass = 0
@@ -29,22 +30,17 @@ globalThis.clearInterval = (id) => {
   if (timers[id - 1]) timers[id - 1].cleared = true
 }
 function tick(n) {
-  for (let i = 0; i < n; i++) timers.filter((t) => !t.cleared).forEach((t) => t.fn())
+  for (let i = 0; i < n; i++) {
+    NOW += 0.2
+    timers.filter((t) => !t.cleared).forEach((t) => t.fn())
+  }
 }
 
 // The clock is driven by hand: the lookout always compares against the deadline.
 let NOW = 1800000000
 const realNow = Date.now
-Date.now = () => NOW * 1000
+Date.now = () => Math.round(NOW * 1000)
 const T = NOW + 1800 // target half an hour away
-
-// The thresholds now DROP as the alarm time approaches: a test expecting a fixed
-// number would be lying. They are asked of the same curve the lookout uses.
-const { peakThreshold } = await import('../probe/utils/threshold.js')
-// A movement that beats the threshold at a given moment, with some margin.
-function movementOf(deviation) {
-  return { x: 0, y: 0, z: 1000 + deviation }
-}
 
 await import('../probe/page/lookout.js')
 
@@ -72,9 +68,19 @@ function newPage() {
 }
 // Still wrist: only gravity on the z axis.
 const STILL = { x: 0, y: 0, z: 1000 }
-// A jolt that beats even the highest threshold on the curve (half an hour from
-// the alarm). Real measurement from 23 Aug: arm shaken → deviation 1765.
-const MOVING = movementOf(2600)
+// A single spike is intentionally insufficient, including its return to rest.
+const MOVING = { x: 0, y: 0, z: 3600 }
+
+// Small rotations keep |acceleration| at 1000, unlike the old constant-offset
+// fixtures which never actually moved between readings.
+function move(n = 9, degrees = 5) {
+  const angle = degrees * Math.PI / 180
+  const turned = { x: 1000 * Math.sin(angle), y: 0, z: 1000 * Math.cos(angle) }
+  for (let i = 0; i < n; i++) {
+    globalThis.__stub.acc = i % 2 ? STILL : turned
+    tick(1)
+  }
+}
 
 function navigated() {
   return (globalThis.__stub.pushed || []).concat(globalThis.__stub.replaced || [])
@@ -96,8 +102,7 @@ await test('decisive MOVEMENT: it hands over to the ring page', () => {
   p.build()
   tick(5)
   assert.equal(navigated().length, 0)
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   assert.ok(navigated().indexOf('page/ring') >= 0, 'the movement did not make the alarm ring')
 })
 
@@ -135,25 +140,53 @@ await test('after implausible readings, REAL movement is still caught', () => {
   p.build()
   tick(10)
   assert.equal(navigated().length, 0)
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   assert.ok(navigated().indexOf('page/ring') >= 0, 'the guard made the lookout deaf')
 })
 
-// ⭐ THE CURVE IN ACTION: the same movement that is not enough half an hour out
-// wakes you three minutes from the alarm. It is the heart of the idea.
-await test('THE CURVE: the same movement is not enough early, is enough late', () => {
-  const medium = movementOf(300) // below the -30 min threshold (500), above the -2.5 min one (60)
+for (const [secondsLeft, threshold] of [[1500, 57], [30, 40]]) {
+  await test('clear movement wakes with ' + secondsLeft + ' seconds remaining', () => {
+    NOW = T - secondsLeft
+    globalThis.__stub.acc = STILL
+    const p = newPage()
+    p.build()
+    tick(1)
+    move()
+    assert.ok(navigated().includes('page/ring'))
+    assert.match(readEvents(), new RegExp('movement [0-9]+ over ' + threshold))
+  })
+}
+
+for (const windowSec of [60, 600, 1800]) {
+  await test('sensitivity advances within a ' + windowSec + '-second window', () => {
+    patch({ windowSec })
+    NOW = T - windowSec
+    globalThis.__stub.acc = STILL
+    const p = newPage()
+    p.build()
+    tick(1)
+    move(9, 3)
+    assert.equal(navigated().length, 0, 'moderate motion should not pass at the start')
+    NOW = T - windowSec / 10
+    globalThis.__stub.acc = STILL
+    tick(1)
+    move(3, 3)
+    assert.equal(navigated().length, 0, 'three adjacent readings must still be insufficient')
+    move(6, 3)
+    assert.ok(navigated().includes('page/ring'), 'the same motion should pass near the target')
+  })
+}
+
+await test('a late opening uses the remaining window instead of restarting sensitivity', () => {
+  patch({ windowSec: 600 })
+  NOW = T - 60
   globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
-  globalThis.__stub.acc = medium
-  tick(20)
-  assert.equal(navigated().length, 0, 'half an hour out a medium movement must not wake you')
-
-  NOW = T - 150 // two and a half minutes to go
-  tick(10)
-  assert.ok(navigated().indexOf('page/ring') >= 0, 'two minutes out the same movement must wake you')
+  tick(1)
+  move(9, 3)
+  assert.ok(navigated().includes('page/ring'))
+  assert.match(readEvents(), /"threshold":42/)
 })
 
 await test('a SINGLE isolated jolt is not enough (that is noise, not an awakening)', () => {
@@ -179,83 +212,55 @@ await test('DEADLINE reached without moving: it rings anyway', () => {
   assert.ok(navigated().indexOf('page/ring') >= 0, 'the lookout missed the deadline')
 })
 
-// The threshold lives in the code, not in the saved state (23 Aug: the old state
-// held 250 while the code said 200, silently). Here we prove that a movement
-// BELOW the threshold — the slow turn measured at 122 — is not enough half an
-// hour from the alarm (threshold 500). In the last 10 minutes, though, it MUST
-// be enough: it is the "light movement" of the curve (threshold 100).
-await test('slow turn (122): half an hour out it does NOT ring, at 8 minutes it DOES', () => {
+await test('an old numeric threshold does not override the new sensitivity', () => {
+  patch({ motionThreshold: 1 })
   globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
-  tick(3)
-  globalThis.__stub.acc = { x: 0, y: 0, z: 1122 } // deviation 122
-  tick(20)
-  assert.equal(navigated().length, 0, 'half an hour out a slow turn must not wake you')
-
-  NOW = T - 480 // 8 minutes to go: threshold 100
-  tick(10)
-  assert.ok(navigated().indexOf('page/ring') >= 0, 'at 8 minutes light movement must wake you')
+  tick(1)
+  move(40, 1)
+  assert.equal(navigated().length, 0)
 })
 
-await test('an old threshold in the state can NO LONGER lower the guard', () => {
-  patch({ motionThreshold: 20 }) // leftover from an earlier version
+await test('small repeated motion stays below threshold throughout the last minute', () => {
+  NOW = T - 61
   globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
-  tick(3)
-  globalThis.__stub.acc = { x: 0, y: 0, z: 1100 } // deviation 100: below 500 (half an hour out)
-  tick(20)
-  assert.equal(navigated().length, 0, 'a value left in the state overrode the threshold in the code')
+  tick(1)
+  move(250, 1)
+  assert.equal(navigated().length, 0, 'tiny motion triggered the alarm near the deadline')
 })
 
-console.log('\n== the second criterion: THE MEAN over two minutes ==')
-
-// Restlessness: continuous micro-movements the peak never sees, but which say
-// "he is surfacing out of sleep". Threshold FIXED at 50 in the last 10 minutes
-// (25 Aug), half the peak further out.
-// Time has to flow for REAL: the mean works on 10-second buckets.
-function advance(seconds, acc) {
-  for (let s = 0; s < seconds; s++) {
-    globalThis.__stub.acc = acc
-    NOW += 1
-    tick(5) // 5 readings per second
-  }
-}
-
-await test('prolonged restlessness: it wakes you without a single peak', () => {
-  NOW = T - 280 // less than five minutes from the alarm: peak threshold 80, mean 50
+await test('a steady sensor offset is not continuous movement', () => {
+  globalThis.__stub.acc = { x: 0, y: 0, z: 1122 }
   const p = newPage()
   p.build()
-  // Continuous movement at 65: NEVER above the peak threshold (80), but the
-  // two-minute mean goes past 50.
-  advance(130, movementOf(65))
-  assert.ok(navigated().indexOf('page/ring') >= 0, 'continuous micro-movements ignored: the mean criterion does not work')
-  assert.match(readEvents(), /mean \d+ over \d+/, 'the reason must say it was the mean')
+  tick(650)
+  assert.equal(navigated().length, 0, 'a constant offset triggered the alarm')
 })
 
-await test('background noise for two minutes: the mean must NOT wake you', () => {
-  NOW = T - 200
+await test('HIGH sensitivity applies to an existing migrated alarm', () => {
+  initAlarms()
+  const alarm = getAlarm(1)
+  patch({ motionSensitivity: 'high' })
+  globalThis.__stub.acc = STILL
   const p = newPage()
+  p.onInit(JSON.stringify({ id: 1, generation: alarm.generation }))
   p.build()
-  advance(130, movementOf(30)) // the measured noise floor: 20-40
-  assert.equal(navigated().length, 0, 'background noise tripped the mean: false alarms every night')
+  tick(1)
+  move(9, 2.5)
+  assert.ok(navigated().includes('page/ring'), 'saved alarm ignored the global preference')
+  assert.match(readEvents(), /"sensitivity":"high"/)
 })
 
-await test('history too short: the mean does not decide (few samples deceive)', () => {
-  NOW = T - 280
+await test('NORMAL sensitivity ignores the same small motion', () => {
+  globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
-  advance(20, movementOf(65)) // above the mean (50) but only 20 seconds of data
-  assert.equal(navigated().length, 0, 'it decided on twenty seconds of history')
-})
-
-await test('far from the alarm the mean stays strict (half the peak)', () => {
-  NOW = T - 1500 // 25 minutes: peak threshold 500, mean 250
-  const p = newPage()
-  p.build()
-  advance(130, movementOf(150))
-  assert.equal(navigated().length, 0, 'at 25 minutes a mean of 150 must not be enough')
+  tick(1)
+  move(20, 2.5)
+  assert.equal(navigated().length, 0)
 })
 
 console.log('\n== it must NEVER stay on for nothing ==')
@@ -287,8 +292,7 @@ await test('ONE failed state read must not switch the smart wake off', () => {
   tick(30)
   globalThis.__stub.throwFsOpen = false
   assert.ok(!readEvents().includes('LOOKOUT closed'), 'it closed over one unlucky read')
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   assert.ok(navigated().indexOf('page/ring') >= 0, 'after the false alarm it no longer feels movement')
 })
 
@@ -333,8 +337,7 @@ await test('BROKEN navigation: it really stays listening and tries again', () =>
   globalThis.__stub = { acc: STILL, initialBrightness: 50, throwReplace: true, throwPush: true }
   const p = newPage()
   p.build()
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   assert.match(readEvents(), /still listening/, 'it did not even try to say so')
   assert.ok(timers.filter((t) => !t.cleared).length > 0, 'it killed the timer: "still listening" was an empty promise')
   assert.equal(globalThis.__stub.brightness, 50, 'screen left at full brightness in the bedroom for an hour')
@@ -352,8 +355,7 @@ await test('sensor readings that throw: the lookout does not die', () => {
   tick(20)
   assert.equal(navigated().length, 0, 'it woke you over a read error')
   globalThis.__stub.throwAcc = false
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   assert.ok(navigated().indexOf('page/ring') >= 0, 'after the error it no longer feels anything')
 })
 
@@ -369,27 +371,27 @@ await test('very dark screen: black background and brightness at minimum', () =>
 })
 
 await test('when it wakes you, the brightness goes back to normal', () => {
-  globalThis.__stub.acc = MOVING
+  globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
-  tick(10)
+  tick(1)
+  move()
   assert.equal(globalThis.__stub.brightness, 100, 'waking you with the screen dark: STOP would be invisible')
 })
 
-// ⭐ Every night leaves the answer to the open question by itself: are real-time
-// stages usable? The alarm does not use them, but it records them.
-await test('the sleep STAGES also end up in the diary, minute by minute', () => {
+await test('VERBOSE records movement statistics without health data', () => {
+  patch({ debugLog: 1 })
   globalThis.__stub.acc = STILL
-  globalThis.__stub.sleepingStatus = 1
-  globalThis.__stub.stages = [{ start: 100, stop: 200, model: 4 }]
   const p = newPage()
   p.build()
   tick(2)
   NOW += 61
   tick(2)
   const ev = readEvents()
-  assert.match(ev, /"sleep":/, 'without the stages in the log the open question stays open')
-  assert.match(ev, /"asleep":1/, 'the sleep status was not recorded')
+  assert.match(ev, /LOOKOUT minute/)
+  assert.match(ev, /"threshold":/)
+  assert.match(ev, /"samples":/)
+  assert.doesNotMatch(ev, /sleep|stage|wear|heart_rate/i)
 })
 
 // TEST SCREEN: same page, two outfits. At night it must not wake anyone.
@@ -411,18 +413,133 @@ await test('TEST SCREEN on: readable, to see what is going on', () => {
 })
 
 await test('the diary records the open, the minutes and the reason for waking', () => {
+  patch({ debugLog: 1 })
   globalThis.__stub.acc = STILL
   const p = newPage()
   p.build()
   tick(2)
   NOW += 61 // a minute goes by
   tick(2)
-  globalThis.__stub.acc = MOVING
-  tick(5)
+  move()
   const ev = readEvents()
   assert.match(ev, /LOOKOUT opened/)
   assert.match(ev, /LOOKOUT minute/, 'the per-minute row is missing: without it the threshold cannot be tuned')
   assert.match(ev, /LOOKOUT WAKE/)
+})
+
+
+/** Observe screen updates without slowing or replacing the sensor loop. */
+function trackDiagnosticText() {
+  const label = uiStub.__byType('TEXT').find((widget) => widget.opts.h === 110)
+  assert.ok(label)
+  const updates = []
+  const setProperty = label.setProperty
+  label.setProperty = function (property, value) {
+    if (property === uiStub.prop.TEXT) updates.push({ at: Date.now(), text: value })
+    return setProperty.call(this, property, value)
+  }
+  return updates
+}
+
+await test('night mode skips diagnostic text updates while movement still triggers the alarm', () => {
+  patch({ lookoutVisible: 0 })
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  const updates = trackDiagnosticText()
+  tick(25)
+  move()
+  assert.equal(updates.length, 0)
+  assert.ok(navigated().includes('page/ring'))
+})
+
+await test('test screen updates at most once per second while sampling remains at five Hz', () => {
+  patch({ lookoutVisible: 1 })
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  const updates = trackDiagnosticText()
+  let samples = 0
+  const sample = p.motion.sample
+  p.motion.sample = function (...args) {
+    samples++
+    return sample.apply(this, args)
+  }
+  tick(50)
+  assert.equal(samples, 50)
+  assert.equal(updates.length, 10)
+  assert.match(updates[0].text, /movement 0 \/ 60/)
+  for (let i = 1; i < updates.length; i++) {
+    assert.ok(updates[i].at - updates[i - 1].at >= 1000)
+  }
+  assert.equal(navigated().length, 0)
+})
+
+await test('movement triggers between text refreshes without waiting for the next refresh', () => {
+  patch({ lookoutVisible: 1 })
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  const updates = trackDiagnosticText()
+  tick(2)
+  assert.equal(updates.length, 1)
+  const before = Date.now()
+  move(7)
+  assert.ok(navigated().includes('page/ring'))
+  assert.equal(Date.now() - before, 1400)
+  assert.equal(updates.length, 2)
+  assert.ok(updates[updates.length - 1].at < Date.now())
+})
+
+
+await test('MINIMAL records opening and wake-up but no periodic logs or diagnostic sensor reads', () => {
+  patch({ debugLog: 0 })
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  const before = readEvents()
+  tick(610)
+  assert.equal(readEvents(), before)
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
+  move()
+  assert.ok(navigated().includes('page/ring'))
+  assert.match(readEvents(), /LOOKOUT opened/)
+  assert.match(readEvents(), /LOOKOUT WAKE/)
+})
+
+await test('changing verbosity during listening enables and stops periodic diagnostics', () => {
+  patch({ debugLog: 0 })
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  tick(310)
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
+  patch({ debugLog: 1 })
+  tick(310)
+  assert.equal(globalThis.__stub.updateInfoCalls || 0, 0)
+  assert.match(readEvents(), /LOOKOUT minute/)
+  assert.doesNotMatch(readEvents(), /sleep|stage|wear|heart_rate/i)
+  patch({ debugLog: 0 })
+  tick(25)
+  const before = readEvents()
+  const reads = globalThis.__stub.updateInfoCalls
+  tick(310)
+  assert.equal(readEvents(), before)
+  assert.equal(globalThis.__stub.updateInfoCalls, reads)
+})
+
+await test('a short multi-reading burst is ignored while smaller sustained motion wakes', () => {
+  NOW = T - 900
+  globalThis.__stub.acc = STILL
+  const p = newPage()
+  p.build()
+  tick(1)
+  move(3, 15)
+  globalThis.__stub.acc = STILL
+  tick(20)
+  assert.equal(navigated().length, 0)
+  move(9, 3)
+  assert.ok(navigated().includes('page/ring'))
 })
 
 Date.now = realNow

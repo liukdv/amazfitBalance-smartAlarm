@@ -9,12 +9,12 @@
 // until STOP is pressed — like a real alarm.
 import * as hmUI from '@zos/ui'
 import { BasePage } from '@zeppos/zml/base-page'
-import * as alarmMgr from '@zos/alarm'
 import { getDeviceInfo } from '@zos/device'
 import { setPageBrightTime, setBrightness } from '@zos/display'
 import { home } from '@zos/router'
 import { logEvent } from '../utils/log'
-import { load, patch } from '../utils/store'
+import { pageAlarm, resumePending, dismissAlarm } from '../utils/alarms'
+import { fmtDays, fmtTime } from '../utils/schedule'
 import { wakeBuzz } from '../utils/vibrate'
 
 const BUZZ_EVERY_MS = 1800 // dense: it must wake you up, not remind you
@@ -34,30 +34,11 @@ function clockNow() {
   return p(d.getHours()) + ':' + p(d.getMinutes())
 }
 
-function cancelAll() {
-  let n = 0
-  try {
-    const ids = alarmMgr.getAllAlarms ? alarmMgr.getAllAlarms() : []
-    if (Array.isArray(ids))
-      ids.forEach((id) => {
-        try {
-          alarmMgr.cancel(id)
-          n++
-        } catch (e) {}
-      })
-  } catch (e) {}
-  return n
-}
-
 // ⚠️ These live on `this`, NOT as module variables (23 Aug review, finding 2).
 // At the alarm time the page can be opened TWICE almost together — by the
 // failsafe alarm and by the lookout handing over — and with shared state the
 // destruction of the first instance switched off the second one's timer: the
 // alarm buzzed once and then fell silent.
-let infoText = null
-let bigText = null
-let stopBtn = null
-let bg = null
 
 // Leaving the page: ONLY home(), with the outcome captured.
 //
@@ -77,7 +58,12 @@ function tryExit() {
 
 Page(
   BasePage({
+    onInit(params) {
+      this.alarm = pageAlarm(params)
+    },
+
     build() {
+      this.alarm = this.alarm || pageAlarm()
       // Explicit reset: the page can be reopened (the service opens it, then the
       // failsafe arrives). Without this, the second open would find the counter
       // already at the cap and fall silent immediately.
@@ -85,13 +71,17 @@ Page(
       this.stopped = false
       this.timerId = null
       this.exitTimerId = null
+      this.infoText = null
+      this.bigText = null
+      this.stopBtn = null
+      this.bg = null
 
       // ⛔ STOP already pressed (23 Aug review, finding 3): if a surviving alarm
       // reopens this page after the alarm has been switched off, we do NOT start
       // buzzing again. The service has always had a guard like this; the page did
       // not, and it would have started ringing again half an hour after STOP.
       try {
-        const already = load()
+        const already = this.alarm.load()
         if (already.ringStop === 1 && already.done === 1) {
           logEvent('RING reopened after STOP, not ringing', {})
           this.closeNow()
@@ -117,7 +107,7 @@ Page(
       } catch (e) {}
 
       try {
-        bg = hmUI.createWidget(hmUI.widget.FILL_RECT, {
+        this.bg = hmUI.createWidget(hmUI.widget.FILL_RECT, {
           x: 0,
           y: 0,
           w: w,
@@ -140,7 +130,7 @@ Page(
       } catch (e) {}
 
       try {
-        bigText = hmUI.createWidget(hmUI.widget.TEXT, {
+        this.bigText = hmUI.createWidget(hmUI.widget.TEXT, {
           x: 0,
           y: Math.round(h * 0.34),
           w: w,
@@ -153,7 +143,7 @@ Page(
       } catch (e) {}
 
       try {
-        infoText = hmUI.createWidget(hmUI.widget.TEXT, {
+        this.infoText = hmUI.createWidget(hmUI.widget.TEXT, {
           x: 6,
           y: Math.round(h * 0.44),
           w: w - 12,
@@ -168,7 +158,7 @@ Page(
 
       const BW = Math.round(w * 0.72)
       try {
-        stopBtn = hmUI.createWidget(hmUI.widget.BUTTON, {
+        this.stopBtn = hmUI.createWidget(hmUI.widget.BUTTON, {
           x: Math.round((w - BW) / 2),
           y: Math.round(h * 0.6),
           w: BW,
@@ -207,11 +197,15 @@ Page(
       // review, finding 3: the double count closed the ringing sequence one
       // round earlier than intended.
       try {
-        patch({ mode: 'ringing', lastRingUnix: Math.floor(Date.now() / 1000) })
+        this.alarm.patch({ mode: 'ringing', lastRingUnix: Math.floor(Date.now() / 1000) })
       } catch (e) {}
     },
 
     buzz() {
+      if (!this.alarm.valid()) {
+        this.onDestroy()
+        return
+      }
       this.count++
       let res = 'err'
       try {
@@ -220,7 +214,7 @@ Page(
         res = 'err:' + (e && e.message)
       }
       try {
-        if (infoText) infoText.setProperty(hmUI.prop.TEXT, 'buzz ' + this.count + ' · ' + res)
+        if (this.infoText) this.infoText.setProperty(hmUI.prop.TEXT, 'buzz ' + this.count + ' · ' + res)
       } catch (e) {}
       if (this.count === 1 || this.count % 10 === 0) {
         try {
@@ -245,8 +239,8 @@ Page(
         logEvent('RING vibration cap reached, staying armed', { buzzes: this.count })
       } catch (e) {}
       try {
-        if (infoText)
-          infoText.setProperty(hmUI.prop.TEXT, 'paused after ' + this.count + ' buzzes · the alarm stays armed')
+        if (this.infoText)
+          this.infoText.setProperty(hmUI.prop.TEXT, 'paused after ' + this.count + ' buzzes · the alarm stays armed')
       } catch (e) {}
     },
 
@@ -266,25 +260,43 @@ Page(
         if (this.timerId !== null) clearInterval(this.timerId)
       } catch (e) {}
       this.timerId = null
-      const n = cancelAll()
+      let n = 0
+      let dismissed
       try {
-        patch({ mode: 'idle', done: 1, ringStop: 1 })
-      } catch (e) {}
+        dismissed = dismissAlarm(this.alarm)
+        n = dismissed.cancelled
+      } catch (e) {
+        this.stopped = false
+        logEvent('RING stop ERROR', { id: this.alarm.id, error: String(e) })
+        if (this.infoText) this.infoText.setProperty(hmUI.prop.TEXT, 'Stop failed: try again')
+        return
+      }
       try {
         logEvent('RING STOPPED', { buzzes: this.count, alarmsCancelled: n })
       } catch (e) {}
       try {
-        if (bg) bg.setProperty(hmUI.prop.MORE, { x: 0, y: 0, w: 466, h: 466, color: 0x14532d })
+        resumePending()
+      } catch (e) {
+        logEvent('RING resume next ERROR', { error: String(e) })
+      }
+      try {
+        const { w, h } = screen()
+        if (this.bg) this.bg.setProperty(hmUI.prop.MORE, { x: 0, y: 0, w, h, color: 0x14532d })
       } catch (e) {}
       try {
-        if (bigText) bigText.setProperty(hmUI.prop.TEXT, 'OFF')
+        if (this.bigText) this.bigText.setProperty(hmUI.prop.TEXT, dismissed.next ? 'STOPPED' : 'OFF')
       } catch (e) {}
       try {
-        if (stopBtn) stopBtn.setProperty(hmUI.prop.TEXT, 'OK · EXIT')
+        if (this.stopBtn) this.stopBtn.setProperty(hmUI.prop.TEXT, 'OK · EXIT')
       } catch (e) {}
       try {
-        if (infoText)
-          infoText.setProperty(hmUI.prop.TEXT, 'alarm off · ' + this.count + ' buzzes')
+        if (this.infoText) {
+          const next = dismissed.next
+          this.infoText.setProperty(hmUI.prop.TEXT, dismissed.error
+            ? 'Repeat failed: enable the alarm again in the app'
+            : next ? fmtDays(next.weekdays) + ' · ' + fmtTime(next.alarmH, next.alarmM) + ' · still ON'
+              : 'alarm off · ' + this.count + ' buzzes')
+        }
       } catch (e) {}
 
       // GENTLE EXIT: after 2s (long enough to read OFF) a SINGLE home(), and a

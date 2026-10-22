@@ -1,508 +1,791 @@
-// Tests for the ALARM SCREEN — the only one that matters tonight.
-//
-// It covers the evening path (pick the time, press SET) and above all the ways
-// it could fail silently.
 import assert from 'node:assert/strict'
-import * as uiStub from '@zos/ui'
-import * as alarmStub from '@zos/alarm'
-import * as fsStub from '@zos/fs'
+import { test, beforeEach } from 'node:test'
+import * as ui from '@zos/ui'
+import * as fs from '@zos/fs'
+import * as timers from '@zos/alarm'
+import { KEY_HOME, GESTURE_UP, GESTURE_DOWN, GESTURE_LEFT, GESTURE_RIGHT } from '@zos/interaction'
+import { initAlarms, listAlarms, saveAlarm, getAlarm, deleteAlarm } from '../probe/utils/alarms.js'
 import { load, patch } from '../probe/utils/store.js'
-import { nextOccurrence } from '../probe/utils/schedule.js'
-import { logEvent, readEvents } from '../probe/utils/log.js'
+import { diskSizes, logEvent } from '../probe/utils/log.js'
 
-let pass = 0
-let fail = 0
-const failures = []
-
-let pageDef = null
-globalThis.Page = (def) => {
-  pageDef = def
-}
+let definition
+globalThis.Page = (value) => { definition = value }
 globalThis.getApp = () => ({ _options: { globalData: {} } })
-
 await import('../probe/page/index.js')
+const main = definition
+await import('../probe/page/edit.js')
+const editor = definition
+await import('../probe/page/debug.js')
+const diagnostics = definition
 
-async function test(name, fn) {
-  globalThis.__stub = {}
-  uiStub.__reset()
-  fsStub.__reset()
-  alarmStub.__reset()
-  try {
-    await fn()
-    pass++
-    console.log('  ok   ' + name)
-  } catch (e) {
-    fail++
-    failures.push(name + ' -> ' + e.message)
-    console.log('  FAIL ' + name + '\n         ' + e.message)
-  }
-}
-
-function newPage() {
-  return Object.assign(Object.create(pageDef), pageDef, {
-    state: { h: 7, m: 30, armed: false, ringing: false, vlog: false },
+let deferred
+beforeEach((t) => {
+  deferred = new Map()
+  let nextTimer = 1
+  t.mock.method(globalThis, 'setTimeout', (callback) => {
+    const id = nextTimer++
+    deferred.set(id, callback)
+    return id
   })
-}
-function texts() {
-  return uiStub.__byType('TEXT').map((w) => String(w.props.TEXT || ''))
-}
-function buttons() {
-  return uiStub.__byType('BUTTON')
-}
-// The LIVE label of a button: the one changed with setProperty (SET becoming
-// DELETE), not the one it was created with.
-function label(x) {
-  return String(x.props.TEXT !== undefined ? x.props.TEXT : x.opts.text)
-}
-function click(part) {
-  const b = buttons().find((x) => label(x).includes(part))
-  if (!b)
-    throw new Error('button not found: ' + part + ' — ' + buttons().map(label).join(' / '))
-  b.opts.click_func()
-  return b
-}
-
-// The FOUR alarms that SET must leave in the queue:
-//  - `first`    the service chain (sensors and decision)
-//  - page       the RING PAGE at the exact time (the only thing that really
-//               makes the motor vibrate: since 22 Aug we know the background
-//               cannot)
-//  - `failsafe` the service at alarm time +5s, which retries opening the page
-//  - lookout    the page that listens to the accelerometer from the moment the
-//               window opens (since 23 Aug: in the background no sensor feels
-//               the movement, in the foreground it does)
-const ARM_ALARMS = 4
-function armAlarms() {
-  const first = alarmStub.__scheduled.find((a) => a.param === 'first')
-  const page = alarmStub.__scheduled.find((a) => a.url === 'page/ring')
-  const failsafe = alarmStub.__scheduled.find((a) => a.param === 'failsafe' && a.file)
-  const lookout = alarmStub.__scheduled.find((a) => a.url === 'page/lookout')
-  return { first, page, failsafe, lookout }
-}
-
-console.log('\n== the screen always opens ==')
-
-await test('build() draws, and shows the time in large type', () => {
-  const p = newPage()
-  p.build()
-  assert.ok(uiStub.__created.length > 0, 'black screen')
-  assert.ok(texts().some((t) => t.indexOf('07:30') >= 0), 'time not shown: ' + texts().join(' | '))
+  t.mock.method(globalThis, 'clearTimeout', (id) => deferred.delete(id))
+  globalThis.__stub = { deviceInfo: { width: 480, height: 480 } }
+  fs.__reset()
+  timers.__reset()
+  ui.__reset()
 })
 
-await test('FEW buttons: two adjustments, one gesture, the debug page', () => {
-  const p = newPage()
-  p.build()
-  const labels = buttons().map(label)
-  ;['HOUR +1', 'MIN +1', 'SET', 'debug'].forEach((l) =>
-    assert.ok(labels.some((x) => x.includes(l)), 'missing ' + l)
-  )
-  assert.equal(buttons().length, 4, 'the first page must have 4 buttons, not ' + buttons().length)
-  // No test buttons and no window picker on the first page: window is a fixed 30.
-  ;['BUZZ', 'MONITOR', 'SAMPLE', 'PERMISSIONS', 'WINDOW', 'TEST'].forEach((l) =>
-    assert.ok(!labels.some((x) => x.includes(l)), 'the first page must not have ' + l)
-  )
+function openEditor(id) {
+  const page = { ...editor }
+  page.onInit(JSON.stringify({ id }))
+  page.build()
+  return page
+}
+
+test('sensitivity cycles, persists on reopening and preserves saved alarms', () => {
+  initAlarms()
+  const original = listAlarms()
+  const page = { ...diagnostics }
+  page.build()
+  click('SENSITIVITY: NORMAL')
+  assert.equal(load().motionSensitivity, 'high')
+  ui.__reset()
+  page.build()
+  click('SENSITIVITY: HIGH')
+  assert.equal(load().motionSensitivity, 'low')
+  click('SENSITIVITY: LOW')
+  assert.equal(load().motionSensitivity, 'normal')
+  assert.deepEqual(listAlarms(), original)
 })
 
-await test('state VISIBLE: when off it says "no alarm", the gesture is SET', () => {
-  const p = newPage()
-  p.build()
-  assert.ok(texts().some((t) => t.indexOf('no alarm') >= 0), 'the off state is not visible: ' + texts().join(' | '))
-  assert.ok(buttons().some((b) => label(b) === 'SET'))
+test('a sensitivity save failure keeps the previous label and reports the error', () => {
+  patch({ motionSensitivity: 'normal' })
+  const page = { ...diagnostics }
+  page.build()
+  globalThis.__stub.throwFsWrite = true
+  click('SENSITIVITY: NORMAL')
+  globalThis.__stub.throwFsWrite = false
+  assert.equal(load().motionSensitivity, 'normal')
+  assert.ok(ui.__byType('TEXT').some((item) => /Cannot save sensitivity/.test(item.props.TEXT)))
+  assert.ok(ui.__byType('BUTTON').some((item) =>
+    (item.props.TEXT || item.props.text) === 'SENSITIVITY: NORMAL'))
 })
 
-await test('after SET the state says ARMED and the gesture becomes DELETE', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.ok(texts().some((t) => t.indexOf('ARMED') >= 0), 'ARMED missing: ' + texts().join(' | '))
-  assert.ok(buttons().some((b) => label(b) === 'DELETE'), 'the gesture should have become DELETE')
+test('FULL RESET restores both normal sensitivity and its label', () => {
+  patch({ motionSensitivity: 'high' })
+  const page = { ...diagnostics }
+  page.build()
+  click('FULL RESET')
+  assert.equal(load().motionSensitivity, 'normal')
+  click('SENSITIVITY: NORMAL')
+  assert.equal(load().motionSensitivity, 'high')
+})
+function buttonFor(label) {
+  const labelled = ui.__created.find((item) =>
+    item.props.VISIBLE !== false && (item.props.TEXT || item.props.text) === label)
+  assert.ok(labelled, 'Missing label: ' + label)
+  if (labelled.type === 'BUTTON') return labelled
+  assert.equal(labelled.enabled, false, label + ' label must pass touches through')
+  const x = labelled.opts.x + labelled.opts.w / 2
+  const y = labelled.opts.y + labelled.opts.h / 2
+  const button = ui.__byType('BUTTON').find((item) => {
+    const bounds = item.opts
+    return item.props.VISIBLE !== false && x >= bounds.x && x < bounds.x + bounds.w &&
+      y >= bounds.y && y < bounds.y + bounds.h
+  })
+  assert.ok(button, 'Missing button beneath label: ' + label)
+  return button
+}
+
+function click(label) {
+  buttonFor(label).opts.click_func()
+}
+
+test('main migrates the saved alarm and offers add, edit and a separate toggle', () => {
+  patch({ alarmH: 19, alarmM: 30 })
+  const page = { ...main }
+  page.build()
+  assert.equal(listAlarms().length, 1)
+  click('19:30')
+  assert.equal(globalThis.__stub.lastPush.url, 'page/edit')
+  assert.equal(JSON.parse(globalThis.__stub.lastPush.params).id, 1)
+  click('+ ADD ALARM')
+  assert.equal(JSON.parse(globalThis.__stub.lastPush.params).id, null)
+})
+
+test('switching one row off preserves the other alarm and refreshes on return', () => {
+  initAlarms()
+  saveAlarm(1, 7, 30, true)
+  const other = saveAlarm(null, 8, 10, true)
+  const page = { ...main }
+  page.build()
+  click('ON')
+  assert.equal(getAlarm(1).ringStop, 1)
+  assert.equal(getAlarm(other.id).mode, 'alarm')
+  const count = ui.__created.length
+  page.onResume()
+  assert.equal(ui.__created.length, count, 'Returning must not duplicate rows')
+})
+
+test('touch wheels edit a draft and leaving the editor preserves the original alarm and timers', () => {
+  initAlarms()
+  const alarm = saveAlarm(1, 7, 30, true)
+  const before = [...timers.__scheduled]
+  const page = openEditor(alarm.id)
+  const wheels = ui.__byType('CYCLE_IMAGE_TEXT_LIST')
+  assert.equal(wheels.length, 2)
+  ui.__scrollTo(wheels[0], 21)
+  ui.__scrollTo(wheels[1], 44)
+  assert.equal(page.hour, 22)
+  assert.equal(page.minute, 45)
+  page.onDestroy()
+  assert.deepEqual(getAlarm(alarm.id), alarm)
+  assert.deepEqual(timers.__scheduled, before)
+})
+
+test('SAVE applies both wheel values once and preserves an enabled alarm', () => {
+  initAlarms()
+  saveAlarm(1, 7, 30, true)
+  const page = openEditor(1)
+  page.hour = 21
+  page.minute = 48
+  click('SAVE')
+  const value = getAlarm(1)
+  assert.equal(value.alarmH, 21)
+  assert.equal(value.alarmM, 48)
+  assert.equal(value.mode, 'alarm')
+  assert.equal(globalThis.__stub.backCalls, 1)
+})
+
+test('editing a disabled alarm leaves it disabled', () => {
+  initAlarms()
+  const page = openEditor(1)
+  page.minute = 5
+  click('SAVE')
+  assert.equal(getAlarm(1).mode, 'idle')
+  assert.equal(timers.__scheduled.length, 0)
+})
+
+test('new alarm is saved and enabled without changing an existing alarm', () => {
+  initAlarms()
+  const before = getAlarm(1)
+  const page = openEditor(null)
+  page.hour = 20
+  page.minute = 35
+  click('SAVE')
+  assert.equal(listAlarms().length, 2)
+  assert.deepEqual(getAlarm(1), before)
+  assert.equal(getAlarm(page.id).mode, 'alarm')
+})
+
+test('crown changes the selected field in both directions and wraps', () => {
+  initAlarms()
+  const page = openEditor(1)
+  page.hour = 23
+  globalThis.__stub.crownCallback(KEY_HOME, -12)
+  assert.equal(page.hour, 0)
+  globalThis.__stub.crownCallback(KEY_HOME, 12)
+  assert.equal(page.hour, 23)
+  click('MINUTE')
+  page.minute = 59
+  globalThis.__stub.crownCallback(KEY_HOME, -12)
+  assert.equal(page.minute, 0)
+  assert.equal(page.hour, 23)
+  globalThis.__stub.crownCallback(KEY_HOME, -60)
+  assert.equal(page.minute, 5)
+  page.onDestroy()
+  assert.equal(globalThis.__stub.crownCallback, null)
+})
+
+test('DELETE removes only the selected alarm', () => {
+  initAlarms()
+  const other = saveAlarm(null, 8, 10, true)
+  openEditor(1)
   click('DELETE')
-  assert.ok(texts().some((t) => t.indexOf('no alarm') >= 0))
-  assert.ok(buttons().some((b) => label(b) === 'SET'), 'the gesture should have gone back to SET')
+  assert.equal(getAlarm(1), null)
+  assert.equal(getAlarm(other.id).mode, 'alarm')
 })
 
-await test('every API broken: the page opens all the same', () => {
-  globalThis.__stub = {
-    throwDeviceInfo: true,
-    throwQueryPermission: true,
-    throwRequestPermission: true,
-    throwGetAllAlarms: true,
+test('a rejected timer shows an error and does not claim the alarm is enabled', () => {
+  initAlarms()
+  saveAlarm(1, 7, 30, true)
+  const page = openEditor(1)
+  globalThis.__stub.throwAlarmSet = true
+  click('SAVE')
+  assert.match(page.hintText.props.TEXT, /Alarm OFF/)
+  assert.equal(getAlarm(1).mode, 'idle')
+  assert.equal(globalThis.__stub.backCalls, undefined)
+})
+
+test('retrying SAVE after a scheduling failure does not create another alarm', () => {
+  initAlarms()
+  const page = openEditor(null)
+  globalThis.__stub.throwAlarmSet = true
+  click('SAVE')
+  const id = page.id
+  assert.equal(listAlarms().length, 2)
+  globalThis.__stub.throwAlarmSet = false
+  click('SAVE')
+  assert.equal(page.id, id)
+  assert.equal(listAlarms().length, 2)
+  assert.equal(getAlarm(id).mode, 'alarm')
+})
+
+test('bottom actions fill a split segment and their labels fit inside the Balance', () => {
+  initAlarms()
+  openEditor(1)
+  const buttons = ui.__byType('BUTTON')
+  assert.ok(!buttons.some((button) => button.opts.text === 'CANCEL'))
+  const remove = buttonFor('DELETE').opts
+  const save = buttonFor('SAVE').opts
+  assert.equal(remove.x, 0)
+  assert.equal(save.x + save.w, 480)
+  assert.equal(remove.x + remove.w, 239)
+  assert.equal(save.x, 241)
+  assert.equal(remove.y, save.y)
+  assert.ok(remove.y > 360)
+  for (const action of [remove, save]) {
+    assert.equal(action.y + action.h, 480)
+    assert.equal(action.radius, 0)
   }
-  const p = newPage()
-  p.build()
-  assert.ok(uiStub.__created.length > 0, 'black screen with the APIs broken')
-  assert.ok(buttons().length >= 4)
-})
-
-await test('BUTTON not supported: the time stays on screen anyway', () => {
-  globalThis.__stub = { throwOnWidget: 'BUTTON' }
-  const p = newPage()
-  p.build()
-  assert.ok(texts().some((t) => t.indexOf('07:30') >= 0))
-})
-
-console.log('\n== picking the time: two circular buttons ==')
-
-await test('HOUR +1 advances and wraps at midnight', () => {
-  const p = newPage()
-  p.build()
-  for (let i = 0; i < 17; i++) click('HOUR +1')
-  assert.equal(p.state.h, 0, 'from 7, +17 must come back to 0')
-})
-
-// One minute at a time: with short tests five-minute steps made you wait too
-// long (23 Aug). Wraps at 60.
-await test('MIN +1 advances by one minute and wraps', () => {
-  const p = newPage()
-  p.build()
-  click('MIN +1')
-  assert.equal(p.state.m, 31)
-  for (let i = 0; i < 29; i++) click('MIN +1')
-  assert.equal(p.state.m, 0, 'from 31, +29 must come back to 0')
-})
-
-await test('the time on screen follows the taps (it is the protagonist)', () => {
-  const p = newPage()
-  p.build()
-  click('HOUR +1')
-  click('MIN +1')
-  assert.ok(texts().some((t) => t.indexOf('08:31') >= 0), 'time not updated: ' + texts().join(' | '))
-})
-
-await test('the chosen time is saved and restored on reopening', () => {
-  const p1 = newPage()
-  p1.build()
-  click('HOUR +1')
-  click('MIN +1')
-  const p2 = newPage()
-  uiStub.__reset()
-  p2.build()
-  assert.equal(p2.state.h, 8, 'hour not restored')
-  assert.equal(p2.state.m, 31, 'minutes not restored')
-})
-
-console.log('\n== SET: the gesture that has to work ==')
-
-await test('SET schedules FOUR alarms: chain + ring page + failsafe + lookout', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.equal(alarmStub.__scheduled.length, ARM_ALARMS, 'expected ' + ARM_ALARMS + ', found ' + alarmStub.__scheduled.length)
-  const { first, page, failsafe, lookout } = armAlarms()
-  assert.ok(first, 'the first link of the chain is missing')
-  assert.ok(page, 'THE RING PAGE IS MISSING: no vibration would reach the motor')
-  assert.ok(failsafe, 'the failsafe alarm is missing')
-  assert.equal(first.file, 'app-service/probe')
-  assert.equal(first.store, true, 'without store the alarm does not survive a reboot')
-  const s = load()
-  assert.equal(page.date, s.targetUnix, 'the ring page must open at the EXACT time')
-  assert.equal(page.store, true)
-  assert.ok(!page.file, 'the page opens with url:, not with file: (file starts a mute service)')
-  assert.equal(failsafe.date, s.targetUnix + 5, 'the failsafe must arrive just after the time')
-  assert.ok(lookout, 'THE LOOKOUT IS MISSING: nobody would listen to the movement')
-  assert.equal(lookout.date, s.targetUnix - s.windowSec, 'the lookout must open when the window opens')
-  assert.ok(!lookout.file, 'the lookout is a PAGE: the accelerometer is forbidden in the background')
-  assert.equal(lookout.store, true)
-})
-
-// If the alarm is less than half an hour away the window would already be open:
-// the lookout cannot be born in the past.
-await test('alarm a few minutes away: the lookout starts at once, never in the past', () => {
-  const p = newPage()
-  p.build()
-  const now = Math.floor(Date.now() / 1000)
-  const inTen = new Date((now + 600) * 1000)
-  p.state.h = inTen.getHours()
-  p.state.m = inTen.getMinutes()
-  p.arm()
-  const { lookout } = armAlarms()
-  if (lookout) {
-    assert.ok(lookout.date > now, 'lookout armed in the past: it would never open')
-    assert.ok(lookout.date < load().targetUnix, 'lookout after the alarm: useless')
+  for (const label of ui.__byType('TEXT').filter((item) => ['DELETE', 'SAVE'].includes(item.opts.text))) {
+    const { x, y, w, h } = label.opts
+    for (const px of [x, x + w]) {
+      for (const py of [y, y + h]) {
+        assert.ok(Math.hypot(px - 240, py - 240) <= 240, label.opts.text + ' is clipped')
+      }
+    }
+  }
+  for (const button of buttons.filter((item) => item.opts !== remove && item.opts !== save)) {
+    const { x, y, w, h, radius } = button.opts
+    const r = Math.min(radius, w / 2, h / 2)
+    for (const px of [x + r, x + w - r]) {
+      for (const py of [y + r, y + h - r]) {
+        assert.ok(Math.hypot(px - 240, py - 240) + r <= 240, button.opts.text + ' is clipped')
+      }
+    }
   }
 })
 
-await test('lookout switched off by configuration: the usual three alarms remain', () => {
-  patch({ useLookout: 0 })
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.equal(alarmStub.__scheduled.length, 3, 'the lookout should have been switchable off')
-  const { page, failsafe } = armAlarms()
-  assert.ok(page && failsafe, 'switching the lookout off lost the real alarms')
+test('bedtime wheels edit a draft duration without changing the wake-up time', () => {
+  const original = saveAlarm(null, 7, 30, true, [1, 2, 3, 4, 5])
+  const page = openEditor(original.id)
+  click('BEDTIME: OFF')
+  const wheels = ui.__byType('CYCLE_IMAGE_TEXT_LIST')
+  assert.equal(wheels.length, 2, 'the editor reuses its wheels')
+  ui.__scrollTo(wheels[0], 8)
+  ui.__scrollTo(wheels[1], 14)
+  click('REMINDER: OFF')
+  click('DONE')
+  assert.equal(page.hour, 7)
+  assert.equal(page.minute, 30)
+  assert.equal(page.bedtimeButton.props.TEXT, 'BEDTIME: 09:15 before')
+  assert.deepEqual(getAlarm(original.id), original)
+  click('SAVE')
+  assert.equal(getAlarm(original.id).bedtimeMin, 555)
+  assert.equal(getAlarm(original.id).alarmH, 7)
+  assert.equal(getAlarm(original.id).alarmM, 30)
+  assert.deepEqual(getAlarm(original.id).weekdays, [1, 2, 3, 4, 5])
 })
 
-// The lesson of 22 Aug evening, turned into a test: an alarm with `file:` starts
-// a background service, and from there the vibrator does NOT respond. Only
-// `url:` opens a page.
-await test('at least one alarm points at a PAGE, not only at services', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  const pages = alarmStub.__scheduled.filter((a) => a.url && !a.file)
-  assert.ok(pages.length >= 1, 'every alarm points at a service: the alarm would stay mute')
+test('leaving the editor discards bedtime edits and preserves all original timers', () => {
+  const original = saveAlarm(null, 7, 30, true, [], 480)
+  const before = [...timers.__scheduled]
+  const page = openEditor(original.id)
+  click('BEDTIME: 08:00 before')
+  page.bedtimeHour = 9
+  click('DONE')
+  page.onDestroy()
+  assert.deepEqual(getAlarm(original.id), original)
+  assert.deepEqual(timers.__scheduled, before)
 })
 
-await test('SET saves the target and the FIXED 30-minute window', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  const s = load()
-  assert.equal(s.mode, 'alarm')
-  assert.equal(s.windowSec, 1800, 'fixed 30 min window')
-  assert.equal(s.rings, 0)
-  const now = Math.floor(Date.now() / 1000)
-  assert.equal(s.targetUnix, nextOccurrence(now, 7, 30), 'wrong target')
-  assert.ok(s.targetUnix > now, 'target in the past: it would never ring')
+test('crown edits the bedtime duration independently and restores the alarm wheels', () => {
+  const original = saveAlarm(null, 7, 30, false)
+  const page = openEditor(original.id)
+  click('BEDTIME: OFF')
+  globalThis.__stub.crownCallback(KEY_HOME, -12)
+  assert.equal(page.bedtimeHour, 9)
+  assert.equal(page.hour, 7)
+  click('MINUTES')
+  globalThis.__stub.crownCallback(KEY_HOME, -60)
+  assert.equal(page.bedtimeMinute, 5)
+  assert.equal(page.minute, 30)
+  assert.equal(page.hourButton.props.TEXT, 'HOURS')
+  click('REMINDER: OFF')
+  click('DONE')
+  assert.equal(page.hourWheel.props.LIST_TOP.index, 6)
+  assert.equal(page.minuteWheel.props.LIST_TOP.index, 29)
+  assert.equal(page.hourButton.props.TEXT, 'HOUR')
+  assert.equal(page.minuteButton.props.TEXT, 'MINUTE')
+  click('BEDTIME: 09:05 before')
+  assert.equal(page.hourWheel.props.LIST_TOP.index, 8)
+  assert.equal(page.minuteWheel.props.LIST_TOP.index, 4)
 })
 
-await test('the first wake-up is never more than half an hour away', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  const { first } = armAlarms()
-  const inSec = first.date - Math.floor(Date.now() / 1000)
-  assert.ok(inSec > 0, 'wake-up in the past')
-  assert.ok(inSec <= 1800 + 5, 'first wake-up in ' + inSec + 's: a single distant alarm is fragile')
+test('turning bedtime OFF preserves the wake-up and persists after SAVE', () => {
+  const original = saveAlarm(null, 7, 30, true, [], 480)
+  openEditor(original.id)
+  click('BEDTIME: 08:00 before')
+  click('REMINDER: ON')
+  click('DONE')
+  click('SAVE')
+  assert.equal(getAlarm(original.id).bedtimeMin, 0)
+  assert.equal(getAlarm(original.id).mode, 'alarm')
 })
 
-await test('DELETE then SET again: never double chains nor double failsafes', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  click('DELETE')
-  click('SET')
-  assert.equal(alarmStub.__scheduled.length, ARM_ALARMS, 'duplicated alarms: double vibrations')
+test('an enabled zero-duration reminder stays in the selector with a clear message', () => {
+  initAlarms()
+  const page = openEditor(1)
+  click('BEDTIME: OFF')
+  page.bedtimeHour = 0
+  page.bedtimeMinute = 0
+  click('REMINDER: OFF')
+  click('DONE')
+  assert.equal(page.view, 'bedtime')
+  assert.match(page.hintText.props.TEXT, /at least 1 minute/)
+  assert.equal(getAlarm(1).bedtimeMin || 0, 0)
 })
 
-// ⭐ Changing the time SWITCHES THE ALARM OFF (23 Aug). It used to re-arm on
-// every tap and you could not tell whether it was still armed; with one-minute
-// steps that would mean sixty arm operations to pick an hour.
-await test('changing the time with the alarm ARMED: it SWITCHES IT OFF, and says so', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.equal(load().mode, 'alarm')
-  click('HOUR +1')
-  assert.equal(load().mode, 'idle', 'the alarm stayed armed on a time you can no longer see')
-  assert.equal(alarmStub.__scheduled.length, 0, 'orphan alarms on the old time')
-  assert.ok(
-    texts().some((t) => t.indexOf('OFF') >= 0 || t.indexOf('SET') >= 0),
-    'the screen does not say it is now off: ' + texts().join(' | ')
-  )
-  assert.ok(buttons().some((b) => label(b) === 'SET'), 'the gesture must go back to SET')
+test('a bedtime scheduling failure is visible while keeping the wake-up enabled', () => {
+  const page = openEditor(null)
+  const target = new Date(Date.now() + 2 * 60 * 60 * 1000)
+  page.hour = target.getHours()
+  page.minute = target.getMinutes()
+  page.bedtimeMin = 60
+  globalThis.__stub.rejectAlarm = (options) => JSON.parse(options.param).event === 'bedtime'
+  click('SAVE')
+  assert.match(page.hintText.props.TEXT, /Alarm ON; bedtime reminder failed/)
+  assert.equal(getAlarm(page.id).mode, 'alarm')
+  assert.equal(globalThis.__stub.backCalls, undefined)
 })
 
-await test('after changing the time, SET arms on the new time', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  click('HOUR +1')
-  click('SET')
-  const now = Math.floor(Date.now() / 1000)
-  assert.equal(load().targetUnix, nextOccurrence(now, 8, 30), 'it armed a time different from the one on screen')
-  assert.equal(alarmStub.__scheduled.length, ARM_ALARMS, 'duplicated alarms')
+test('bedtime controls fit inside the round Balance display', () => {
+  initAlarms()
+  openEditor(1)
+  click('BEDTIME: OFF')
+  const visible = ui.__byType('BUTTON').filter((item) => item.props.VISIBLE !== false)
+  assert.equal(visible.length, 4)
+  const done = buttonFor('DONE')
+  assert.equal(done.opts.x, 0)
+  assert.equal(done.opts.w, 480)
+  assert.equal(done.opts.y + done.opts.h, 480)
+  for (const button of visible.filter((item) => item !== done)) {
+    const { x, y, w, h } = button.opts
+    for (const px of [x, x + w]) {
+      for (const py of [y, y + h]) {
+        assert.ok(Math.hypot(px - 240, py - 240) <= 240, button.opts.text + ' is clipped')
+      }
+    }
+  }
 })
 
-// Window 0 = ordinary alarm: no listening, it rings at the exact time.
-await test('window at ZERO: no lookout, it rings at the exact time', () => {
-  patch({ windowMin: 0 })
-  const p = newPage()
-  p.build()
-  click('SET')
-  const s = load()
-  assert.equal(s.windowSec, 0, 'the zero window was not respected')
-  const { lookout, page } = armAlarms()
-  assert.ok(!lookout, 'with a zero window there is no point opening the lookout')
-  assert.ok(page, 'the ring page at the alarm time must remain')
+test('weekday selection is a draft until SAVE and preserves the chosen time', () => {
+  initAlarms()
+  const page = openEditor(null)
+  page.hour = 8
+  page.minute = 45
+  click('DAYS: Once')
+  click('Mon')
+  click('Wed')
+  click('Fri')
+  assert.deepEqual(page.days, [1, 3, 5])
+  assert.equal(listAlarms().length, 1)
+  click('DONE')
+  assert.equal(page.daysButton.props.TEXT, 'DAYS: Mon Wed Fri')
+  click('SAVE')
+  const saved = getAlarm(page.id)
+  assert.deepEqual(saved.weekdays, [1, 3, 5])
+  assert.equal(saved.alarmH, 8)
+  assert.equal(saved.alarmM, 45)
+  assert.equal(saved.mode, 'alarm')
 })
 
-await test('changing the time while OFF: it stays off, no alarms', () => {
-  const p = newPage()
-  p.build()
-  click('HOUR +1')
-  assert.equal(load().mode, 'idle')
-  assert.equal(alarmStub.__scheduled.length, 0, 'touching the time must not arm anything')
+test('leaving the editor discards weekday edits without touching scheduled alarms', () => {
+  const original = saveAlarm(null, 7, 30, true, [1, 2, 3, 4, 5])
+  const scheduled = [...timers.__scheduled]
+  const page = openEditor(original.id)
+  click('DAYS: Weekdays')
+  click('Fri')
+  click('Sun')
+  click('DONE')
+  page.onDestroy()
+  assert.deepEqual(getAlarm(original.id), original)
+  assert.deepEqual(timers.__scheduled, scheduled)
 })
 
-await test('SET does not touch the night-log flag', () => {
-  patch({ debugLog: 0 })
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.equal(load().debugLog, 0, 'arming the alarm switched the log back on')
+test('deselecting all days means Once and removes the automatic rollover on SAVE', () => {
+  const original = saveAlarm(null, 7, 30, true, [6, 0])
+  const page = openEditor(original.id)
+  click('DAYS: Weekends')
+  click('Sat')
+  click('Sun')
+  assert.equal(page.daysTitle.props.TEXT, 'Once')
+  click('DONE')
+  click('SAVE')
+  assert.deepEqual(getAlarm(original.id).weekdays, [])
+  assert.equal(getAlarm(original.id).scheduled.repeat, undefined)
 })
 
-await test('DELETE cancels everything (failsafe included) and goes idle', () => {
-  const p = newPage()
-  p.build()
-  click('SET')
-  click('DELETE')
-  assert.equal(alarmStub.__scheduled.length, 0, 'surviving alarms after DELETE')
-  assert.equal(load().mode, 'idle')
+test('reopening the selector preserves its selection and ignores crown time edits', () => {
+  initAlarms()
+  const page = openEditor(1)
+  const hour = page.hour
+  click('DAYS: Once')
+  click('Tue')
+  globalThis.__stub.crownCallback(KEY_HOME, -60)
+  assert.equal(page.hour, hour)
+  click('DONE')
+  click('DAYS: Tue')
+  assert.deepEqual(page.days, [2])
+  click('Tue')
+  assert.deepEqual(page.days, [])
+  click('DONE')
+  assert.equal(page.daysButton.props.TEXT, 'DAYS: Once')
 })
 
-await test('alarm refused by the system: error on screen AND state NOT armed', () => {
-  globalThis.__stub = { throwAlarmSet: true }
-  const p = newPage()
-  p.build()
-  click('SET')
-  assert.ok(
-    texts().some((t) => t.length && (t.indexOf('set') >= 0 || t.indexOf('alarm') >= 0 || t.indexOf('failsafe') >= 0)),
-    'a silent failure here = a missed alarm: ' + texts().join(' | ')
-  )
-  // 22 Aug review, finding 4: the state used to stay 'alarm' and on reopening
-  // the page said "ARMED" with zero alarms in the queue.
-  assert.equal(load().mode, 'idle', 'the UI would say ARMED with nothing behind it')
-  assert.equal(p.state.armed, false)
+test('OFF and ON preserve recurrence days and the list shows the recurrence', () => {
+  initAlarms()
+  saveAlarm(1, 7, 30, true, [1, 2, 3, 4, 5])
+  const page = { ...main }
+  page.build()
+  assert.ok(ui.__byType('TEXT').some((item) => item.opts.text.includes('Weekdays')))
+  click('ON')
+  assert.deepEqual(getAlarm(1).weekdays, [1, 2, 3, 4, 5])
+  click('OFF')
+  assert.deepEqual(getAlarm(1).weekdays, [1, 2, 3, 4, 5])
+  assert.ok(getAlarm(1).scheduled.repeat)
 })
 
-console.log('\n== auto-upload of the logs on every open ==')
-
-// 23 Aug: "let's get the logs off the watch straight away" — every line copies
-// the whole file, so almost-empty files mean a responsive watch. The main page
-// ships them by itself on open, without asking anyone.
-const settle = () => new Promise((r) => setImmediate(r))
-
-// First, on a clean page: the warning must not appear out of nowhere.
-await test('no logs pending: no pointless warning on screen', () => {
-  const p = newPage()
-  p.build()
-  assert.ok(!texts().some((t) => t.indexOf('logs to upload') >= 0), 'warning shown for no reason')
-})
-
-await test('opening with a full diary: it uploads BY ITSELF and clears the files', async () => {
-  for (let i = 0; i < 20; i++) logEvent('OLD ROW', { n: i, filler: 'x'.repeat(40) })
-  const p = newPage()
-  p.build()
-  await settle()
-  const sent = (globalThis.__stub.requests || []).filter((r) => r.method === 'UPLOAD')
-  assert.equal(sent.length, 1, 'no automatic upload started')
-  assert.ok(sent[0].payload.events.indexOf('OLD ROW') >= 0, 'the diary is not in the package')
-  await settle()
-  const after = readEvents()
-  assert.ok(after.indexOf('OLD ROW') < 0, 'on a successful upload the local files must be cleared')
-  // Only the trace of the upload remains: it is what tells you, in the morning,
-  // that the channel worked — and it will leave with the next upload.
-  assert.match(after, /UPLOAD auto.*ok/, "the upload's outcome must stay written down")
-})
-
-// ⚠️ 23 Aug: the logs stopped arriving and there was no way to tell whether the
-// upload started and failed or never started. Now the outcome is ALWAYS noted.
-await test('failed upload: it writes it in the diary, so you know in the morning', async () => {
-  for (let i = 0; i < 20; i++) logEvent('ROW', { n: i, filler: 'x'.repeat(40) })
-  globalThis.__stub.requestFails = true
-  const p = newPage()
-  p.build()
-  await settle()
-  await settle()
-  assert.match(readEvents(), /UPLOAD auto.*failed/, 'a failed upload leaves no trace')
-})
-
-// The warning must be ON THE WATCH: if the channel is mute, no log will ever be
-// able to report that the logs are not leaving.
-await test('logs stuck on board: the page SAYS SO on screen', async () => {
-  for (let i = 0; i < 20; i++) logEvent('ROW', { n: i, filler: 'x'.repeat(40) })
-  globalThis.__stub.requestFails = true
-  const p = newPage()
-  p.build()
-  await settle()
-  await settle()
-  assert.ok(
-    texts().some((t) => t.indexOf('logs to upload') >= 0),
-    'no on-screen warning about the stuck logs: ' + texts().join(' | ')
-  )
+test('all weekday buttons, presets and completion controls fit the round Balance', () => {
+  initAlarms()
+  openEditor(1)
+  click('DAYS: Once')
+  const visible = ui.__byType('BUTTON').filter((item) => item.props.VISIBLE !== false)
+  assert.equal(visible.length, 10)
+  const sunday = buttonFor('Sun').opts
+  const weekdays = buttonFor('Weekdays').opts
+  const weekend = buttonFor('Weekend').opts
+  assert.ok(sunday.x + sunday.w < weekdays.x)
+  assert.ok(weekdays.x + weekdays.w < weekend.x)
+  assert.equal(sunday.y, weekdays.y)
+  assert.equal(sunday.y, weekend.y)
+  assert.ok(!visible.some((button) => button.opts.text === 'ONCE'))
+  const done = buttonFor('DONE')
+  assert.equal(done.opts.x, 0)
+  assert.equal(done.opts.w, 480)
+  assert.equal(done.opts.y + done.opts.h, 480)
+  for (const button of visible.filter((item) => item !== done)) {
+    const { x, y, w, h } = button.opts
+    for (const px of [x, x + w]) {
+      for (const py of [y, y + h]) {
+        assert.ok(Math.hypot(px - 240, py - 240) <= 240, button.opts.text + ' is clipped')
+      }
+    }
+  }
 })
 
 
-await test('phone unreachable: the page lives on and the logs STAY', async () => {
-  for (let i = 0; i < 20; i++) logEvent('ROW TO KEEP', { n: i, filler: 'x'.repeat(40) })
-  globalThis.__stub.requestFails = true
-  const p = newPage()
-  p.build()
-  await settle()
-  await settle()
-  assert.ok(readEvents().indexOf('ROW TO KEEP') >= 0, 'upload failed but files cleared: logs lost')
-  assert.ok(texts().some((t) => t.indexOf('07:30') >= 0), 'the page must work regardless')
+test('left swipe opens diagnostics without a Debug button or changes to alarms', () => {
+  initAlarms()
+  const page = { ...main }
+  page.build()
+  const alarms = listAlarms()
+  const scheduled = [...timers.__scheduled]
+  assert.equal(ui.__byType('BUTTON').some((item) => item.props.text === 'DEBUG'), false)
+  const gesture = globalThis.__stub.gestureCallback
+  assert.equal(typeof gesture, 'function')
+  for (const direction of [GESTURE_UP, GESTURE_DOWN, GESTURE_RIGHT]) {
+    assert.equal(gesture(direction), false, 'preserve scrolling and system back')
+  }
+  assert.equal(globalThis.__stub.lastPush, undefined)
+  assert.equal(gesture(GESTURE_LEFT), true)
+  assert.equal(globalThis.__stub.lastPush.url, 'page/debug')
+  assert.deepEqual(listAlarms(), alarms)
+  assert.deepEqual(timers.__scheduled, scheduled)
 })
 
-await test('diary almost empty: NO upload (no pointless traffic)', async () => {
-  const p = newPage()
-  p.build()
-  await settle()
-  const sent = (globalThis.__stub.requests || []).filter((r) => r.method === 'UPLOAD')
-  assert.equal(sent.length, 0, 'it shipped nothing at all')
+test('diagnostics swipe is removed on leaving the list and restored on return', () => {
+  initAlarms()
+  const page = { ...main }
+  page.build()
+  page.onPause()
+  assert.equal(globalThis.__stub.gestureCallback, null)
+  page.onResume()
+  assert.equal(globalThis.__stub.gestureCallback(GESTURE_LEFT), true)
+  assert.equal(globalThis.__stub.lastPush.url, 'page/debug')
+  page.onDestroy()
+  assert.equal(globalThis.__stub.gestureCallback, null)
 })
 
-await test('while RINGING: no upload, zero extra work', async () => {
-  for (let i = 0; i < 20; i++) logEvent('ROW', { n: i, filler: 'x'.repeat(40) })
-  patch({ mode: 'ringing', rings: 1 })
-  const p = newPage()
-  p.build()
-  await settle()
-  const sent = (globalThis.__stub.requests || []).filter((r) => r.method === 'UPLOAD')
-  assert.equal(sent.length, 0, 'shipping logs while it rings steals time from the ringing')
+test('weekday highlights follow selection and deselection on API 3.7', () => {
+  initAlarms()
+  const page = openEditor(1)
+  click('DAYS: Once')
+  const widgetCount = ui.__created.length
+  const highlighted = () => ui.__byType('BUTTON')
+    .filter((item) => item.props.VISIBLE !== false && item.props.normal_color === 0x285fa5)
+    .map((item) => item.props.text)
+  assert.deepEqual(highlighted(), [])
+  assert.equal(page.daysTitle.props.TEXT, 'Once')
+  click('Mon')
+  click('Wed')
+  click('Sun')
+  assert.deepEqual(highlighted(), ['Mon', 'Wed', 'Sun'])
+  click('Wed')
+  assert.deepEqual(highlighted(), ['Mon', 'Sun'])
+  assert.equal(page.daysTitle.props.TEXT, 'Repeat on')
+  click('Mon')
+  click('Sun')
+  assert.deepEqual(highlighted(), [])
+  assert.deepEqual(page.days, [])
+  assert.equal(ui.__created.length, widgetCount, 'changing days must not accumulate widgets')
+  assert.equal(page.dayWidgets.length, 12, 'seven days, two presets, a title, a Done button and its label')
 })
 
-console.log('\n== the evening path, from start to finish ==')
-
-await test('I open it, pick 6:45, press SET: everything is consistent', () => {
-  const p = newPage()
-  p.build()
-  for (let i = 0; i < 23; i++) click('HOUR +1') // 7 -> 6 (full lap)
-  for (let i = 0; i < 15; i++) click('MIN +1') // 30 -> 45
-  assert.equal(p.state.h, 6)
-  assert.equal(p.state.m, 45)
-  click('SET')
-  const s = load()
-  const now = Math.floor(Date.now() / 1000)
-  assert.equal(s.targetUnix, nextOccurrence(now, 6, 45))
-  assert.equal(s.mode, 'alarm')
-  assert.equal(alarmStub.__scheduled.length, ARM_ALARMS)
-  assert.ok(texts().some((t) => t.indexOf('06:45') >= 0), 'the confirmed time does not appear')
-  assert.ok(texts().some((t) => t.indexOf('ARMED') >= 0), 'the armed confirmation is missing')
+test('day presets replace the draft and retain individual changes after DONE', () => {
+  const original = saveAlarm(null, 7, 30, true, [2, 4])
+  const page = openEditor(original.id)
+  click('DAYS: Tue Thu')
+  const highlighted = () => ui.__byType('BUTTON')
+    .filter((item) => item.props.VISIBLE !== false && item.props.normal_color === 0x285fa5)
+    .map((item) => item.props.text)
+  assert.deepEqual(highlighted(), ['Tue', 'Thu'])
+  click('Weekend')
+  assert.deepEqual(page.days, [6, 0])
+  assert.deepEqual(highlighted(), ['Sat', 'Sun'])
+  click('Weekdays')
+  assert.deepEqual(page.days, [1, 2, 3, 4, 5])
+  assert.deepEqual(highlighted().sort(), ['Fri', 'Mon', 'Thu', 'Tue', 'Wed'])
+  click('Mon')
+  click('Wed')
+  assert.deepEqual(getAlarm(original.id), original, 'presets remain a draft until SAVE')
+  click('DONE')
+  assert.ok(page.dayWidgets.every((item) => item.props.VISIBLE === false))
+  click('DAYS: Tue Thu Fri')
+  assert.deepEqual(highlighted(), ['Tue', 'Thu', 'Fri'])
+  click('DONE')
+  click('SAVE')
+  assert.deepEqual(getAlarm(original.id).weekdays, [2, 4, 5])
 })
 
-await test('I reopen after arming: it still shows as armed', () => {
-  const p1 = newPage()
-  p1.build()
-  click('SET')
-  uiStub.__reset()
-  const p2 = newPage()
-  p2.build()
-  assert.equal(p2.state.armed, true, 'an armed alarm must show as armed on reopening')
-  assert.ok(texts().some((t) => t.indexOf('ARMED') >= 0))
+
+function assertCenter(list, value) {
+  const size = list.opts.data_size
+  assert.equal((list.topIndex + 1) % size, value, 'chosen value is the middle of three rows')
+  for (const offset of [-1, 0, 1]) {
+    const index = (value + offset + size) % size
+    const color = list.itemStyles[index]?.item_text_color ?? list.opts.item_text_color
+    assert.equal(color, offset === 0 ? 0xffffff : 0x777788, 'only the middle row is highlighted')
+  }
+}
+
+test('hour and minute centers are highlighted immediately without an initial focus event', () => {
+  globalThis.__stub.silentWheelPosition = true
+  const alarm = saveAlarm(null, 7, 30, true)
+  const page = openEditor(alarm.id)
+  assertCenter(page.hourWheel, 7)
+  assertCenter(page.minuteWheel, 30)
+  assert.equal(page.selected, 'hour')
+  click('SAVE')
+  assert.equal(getAlarm(alarm.id).alarmH, 7)
+  assert.equal(getAlarm(alarm.id).alarmM, 30)
 })
 
-await test('I open it WHILE it rings: the screen says to press DELETE', () => {
-  patch({ mode: 'ringing', rings: 1, fired: 1 })
-  const p = newPage()
-  p.build()
-  assert.ok(texts().some((t) => t.indexOf('RINGING') >= 0), 'no indication that it is ringing')
-  click('DELETE')
-  assert.equal(load().mode, 'idle')
+test('touch scrolling saves and highlights the visible middle row regardless of native focus', () => {
+  const alarm = saveAlarm(null, 7, 30, true)
+  const page = openEditor(alarm.id)
+  ui.__scrollTo(page.hourWheel, 21, 21)
+  ui.__scrollTo(page.minuteWheel, 44, 46)
+  assertCenter(page.hourWheel, 22)
+  assertCenter(page.minuteWheel, 45)
+  assert.equal(page.hour, 22)
+  assert.equal(page.minute, 45)
+  click('SAVE')
+  assert.equal(getAlarm(alarm.id).alarmH, 22)
+  assert.equal(getAlarm(alarm.id).alarmM, 45)
 })
 
-await test('switching to the diagnostics page without breaking anything', () => {
-  const p = newPage()
-  p.build()
-  click('debug')
-  assert.deepEqual(globalThis.__stub.pushed, ['page/debug'])
+test('taps and crown keep midnight values centered and highlighted across wrapping', () => {
+  const alarm = saveAlarm(null, 23, 59, false)
+  const page = openEditor(alarm.id)
+  globalThis.__stub.crownCallback(KEY_HOME, -12)
+  assertCenter(page.hourWheel, 0)
+  click('MINUTE')
+  globalThis.__stub.crownCallback(KEY_HOME, -12)
+  assertCenter(page.minuteWheel, 0)
+  page.hourWheel.opts.item_click_func(page.hourWheel, 23)
+  assertCenter(page.hourWheel, 23)
+  assert.equal(page.selected, 'hour')
+  page.minuteWheel.opts.item_click_func(page.minuteWheel, 59)
+  assertCenter(page.minuteWheel, 59)
+  assert.equal(page.selected, 'minute')
 })
 
-await test('diagnostics unreachable: error on screen, alarm intact', () => {
-  globalThis.__stub = { throwPush: true }
-  const p = newPage()
-  p.build()
-  click('debug')
-  click('SET')
-  assert.equal(alarmStub.__scheduled.length, ARM_ALARMS, 'the alarm must work regardless')
+test('bedtime centers are highlighted on entry and wake-up centers are restored on DONE', () => {
+  globalThis.__stub.silentWheelPosition = true
+  const alarm = saveAlarm(null, 7, 30, true, [], 480)
+  const page = openEditor(alarm.id)
+  click('BEDTIME: 08:00 before')
+  assertCenter(page.hourWheel, 8)
+  assertCenter(page.minuteWheel, 0)
+  ui.__scrollTo(page.hourWheel, 8)
+  ui.__scrollTo(page.minuteWheel, 14)
+  assertCenter(page.hourWheel, 9)
+  assertCenter(page.minuteWheel, 15)
+  click('DONE')
+  assertCenter(page.hourWheel, 7)
+  assertCenter(page.minuteWheel, 30)
+  click('SAVE')
+  const saved = getAlarm(alarm.id)
+  assert.equal(saved.alarmH, 7)
+  assert.equal(saved.alarmM, 30)
+  assert.equal(saved.bedtimeMin, 555)
 })
 
-console.log('\n----------------------------------------')
-console.log(pass + ' passed, ' + fail + ' failed')
-if (fail) {
-  console.log('\nFAILURES:')
-  failures.forEach((f) => console.log('  - ' + f))
-  process.exit(1)
+
+function runDeferred() {
+  for (const [id, callback] of [...deferred]) {
+    deferred.delete(id)
+    callback()
+  }
+}
+
+test('selecting and deselecting weekdays replaces only the affected buttons', () => {
+  initAlarms()
+  const page = openEditor(1)
+  click('DAYS: Once')
+  const before = [...page.dayButtons]
+  click('Wed')
+  assert.equal(page.dayButtons.filter((button, i) => button !== before[i]).length, 1)
+  assert.notEqual(page.dayButtons[2], before[2])
+  click('Fri')
+  const selected = [...page.dayButtons]
+  click('Wed')
+  click('Fri')
+  assert.equal(page.dayButtons.filter((button, i) => button !== selected[i]).length, 2)
+  assert.equal(page.dayWidgets.length, 12)
+})
+
+test('returning to an unchanged alarm list reuses every widget', () => {
+  initAlarms()
+  const page = { ...main }
+  page.build()
+  const before = [...ui.__created]
+  page.onPause()
+  page.onResume()
+  assert.deepEqual(ui.__created, before)
+})
+
+test('toggling an alarm replaces only its toggle and preserves other widgets', () => {
+  initAlarms()
+  saveAlarm(1, 7, 30, true)
+  saveAlarm(null, 8, 0, true)
+  const page = { ...main }
+  page.build()
+  const before = new Set(ui.__created)
+  click('ON')
+  assert.equal(ui.__created.filter((item) => !before.has(item)).length, 1)
+  assert.equal(page.widgets.length, before.size)
+  assert.ok(ui.__byType('TEXT').some((item) => /Off/.test(item.props.TEXT)))
+})
+
+test('reused rows read edited time and days and their callbacks use the latest alarm', () => {
+  initAlarms()
+  const page = { ...main }
+  page.build()
+  const before = [...ui.__created]
+  saveAlarm(1, 9, 42, false, [1, 3])
+  page.onResume()
+  assert.deepEqual(ui.__created, before)
+  click('09:42')
+  assert.equal(JSON.parse(globalThis.__stub.lastPush.params).id, 1)
+  assert.ok(ui.__byType('TEXT').some((item) => /Mon Wed/.test(item.props.TEXT)))
+  click('OFF')
+  assert.equal(getAlarm(1).alarmH, 9)
+  assert.equal(getAlarm(1).alarmM, 42)
+  assert.deepEqual(getAlarm(1).weekdays, [1, 3])
+})
+
+test('adding and removing alarms rebuilds the list without leaving stale rows', () => {
+  initAlarms()
+  const page = { ...main }
+  page.build()
+  const other = saveAlarm(null, 8, 12, false)
+  page.onResume()
+  click('08:12')
+  assert.equal(JSON.parse(globalThis.__stub.lastPush.params).id, other.id)
+  deleteAlarm(1)
+  page.onResume()
+  assert.equal(ui.__byType('BUTTON').filter((item) => /^\d\d:\d\d$/.test(item.props.text)).length, 1)
+  deleteAlarm(other.id)
+  page.onResume()
+  assert.ok(ui.__byType('TEXT').some((item) => item.props.text === 'No alarms'))
+  assert.equal(page.widgets.length, ui.__created.length)
+})
+
+test('log sizes use metadata, reflect new data and never read log contents', () => {
+  globalThis.__stub.fsReads = []
+  assert.deepEqual(diskSizes(), { events: 0 })
+  seedLargeLogs()
+  globalThis.__stub.fsReads = []
+  const size = diskSizes().events
+  assert.equal(size, fs.__get('events.log').length)
+  assert.deepEqual(globalThis.__stub.fsReads, [])
+  logEvent('another sample')
+  globalThis.__stub.fsReads = []
+  assert.equal(diskSizes().events, fs.__get('events.log').length)
+  assert.notEqual(diskSizes().events, size, 'a capped append can shrink the file')
+  assert.deepEqual(globalThis.__stub.fsReads, [])
+})
+
+test('opening and resuming the list never reads or sends logs or samples sleep', () => {
+  initAlarms()
+  seedLargeLogs()
+  globalThis.__stub.fsReads = []
+  const page = { ...main }
+  page.build()
+  runDeferred()
+  page.onPause()
+  page.onResume()
+  runDeferred()
+  page.onDestroy()
+  runDeferred()
+  assert.equal(globalThis.__stub.requests, undefined)
+  assert.equal(globalThis.__stub.fsReads.some((read) => /events.log|probe.csv/.test(read.path)), false)
+  assert.deepEqual(globalThis.__stub.permissionAsked, ['device:os.bg_service'])
+  assert.equal(fs.__get('events.log').length, 60000)
+  assert.equal(ui.__byType('TEXT').some((item) => /^Logs:/.test(item.props.TEXT || item.props.text)), false)
+})
+
+test('diagnostics keeps local log controls without offering server upload', () => {
+  initAlarms()
+  const page = { ...diagnostics }
+  page.build()
+  const labels = ui.__byType('BUTTON').map((item) => item.props.TEXT || item.props.text)
+  assert.equal(labels.includes('SEND LOGS'), false)
+  assert.ok(labels.includes('STATE'))
+  assert.ok(labels.includes('LOG: MINIMAL'))
+  click('LOG: MINIMAL')
+  assert.equal(load().debugLog, 1)
+  assert.equal(globalThis.__stub.requests, undefined)
+})
+
+test('scrolling the selected wheel does not rewrite the field buttons', (t) => {
+  initAlarms()
+  const page = openEditor(1)
+  const hourUpdates = t.mock.method(page.hourButton, 'setProperty')
+  const minuteUpdates = t.mock.method(page.minuteButton, 'setProperty')
+  ui.__scrollTo(page.hourWheel, 10)
+  ui.__scrollTo(page.hourWheel, 11)
+  assert.equal(page.hour, 12)
+  assertCenter(page.hourWheel, 12)
+  assert.equal(hourUpdates.mock.callCount(), 0)
+  assert.equal(minuteUpdates.mock.callCount(), 0)
+})
+
+
+function seedLargeLogs() {
+  const fd = fs.openSync({ path: 'events.log', flag: fs.O_CREAT | fs.O_RDWR })
+  fs.writeSync({ fd, buffer: new Uint8Array(60000).fill(120).buffer })
+  fs.closeSync({ fd })
 }

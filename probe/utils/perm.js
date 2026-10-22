@@ -6,21 +6,11 @@
 // relevant permission check and application, otherwise the functional interface
 // will not be allowed to execute". Without requestPermission the background
 // service is blocked silently: no error, it simply never starts.
-import { requestPermission, queryPermission } from '@zos/app'
+import { requestPermission } from '@zos/app'
 
-export const NEEDED = ['device:os.bg_service', 'data:user.hd.sleep', 'data:user.hd.heart_rate']
+export const NEEDED = ['device:os.bg_service']
 
-// 0 = pending (arrives through the callback) · 1 = not requestable · 2 = already granted
-export function checkPermissions() {
-  try {
-    if (typeof queryPermission !== 'function') return { known: false, states: [] }
-    const states = queryPermission({ permissions: NEEDED })
-    return { known: true, states: Array.isArray(states) ? states : [states] }
-  } catch (e) {
-    return { known: false, states: [], error: e && e.message }
-  }
-}
-
+/** Request access needed to run scheduled alarm services. */
 export function askPermissions(cb) {
   try {
     const r = requestPermission({
@@ -35,11 +25,4 @@ export function askPermissions(cb) {
   } catch (e) {
     return { ok: false, code: 'err', error: e && e.message ? e.message : String(e) }
   }
-}
-
-export function summarize(states) {
-  if (!states || !states.length) return 'unknown'
-  return states
-    .map((s, i) => NEEDED[i].split('.').pop() + '=' + s)
-    .join(' ')
 }

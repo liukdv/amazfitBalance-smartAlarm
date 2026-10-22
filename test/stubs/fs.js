@@ -56,9 +56,11 @@ export function writeSync({ fd, buffer, offset = 0, length, position = 0 }) {
 }
 
 export function readSync({ fd, buffer, offset = 0, length, position = 0 }) {
+  if (globalThis.__stub?.throwFsRead) throw new Error('read boom')
   const path = open.get(fd)
   if (!path) throw new Error('EBADF')
   const cur = files.get(path)
+  if (globalThis.__stub?.fsReads) globalThis.__stub.fsReads.push({ path, bytes: cur.length })
   const view = new Uint8Array(buffer)
   const n = Math.min(length === undefined ? cur.length : length, cur.length - position)
   for (let i = 0; i < n; i++) view[offset + i] = cur[position + i]

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 
 // Resolved from this file: the project works wherever it is cloned.
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
-const TARGET = process.argv[2] || 'Amazfit Active 2 (Round)'
+const TARGET = process.argv[2] || 'Amazfit Balance'
 const OUTDIR = join(ROOT, 'inspect')
 // Where the QR to scan is left. Override it with QR_DEST if you want it
 // somewhere handier (a synced folder, the desktop, ...).
@@ -26,10 +26,11 @@ try {
   mkdirSync(dirname(DEST), { recursive: true })
 
   const suites = [
-    ['test/run.mjs', 'logs and samples'],
+    ['test/run.mjs', 'local event logs'],
     ['test/decide.mjs', 'alarm decision'],
     ['test/schedule.mjs', 'times and wake-up steps'],
     ['test/alarm-page.mjs', 'alarm screen'],
+    ['test/alarms.mjs', 'independent alarms'],
     ['test/service.mjs', 'service: simulated nights'],
     ['test/ring-page.mjs', 'ring page'],
     ['test/lookout.mjs', 'lookout: listening to movement'],
